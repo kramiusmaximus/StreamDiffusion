@@ -519,7 +519,9 @@ class StreamParameterUpdater(OrchestratorUser):
         # Handle CFG properly - need to set both conditional and unconditional if using CFG
         if self.stream.cfg_type in ["full", "initialize"] and self.stream.guidance_scale > 1.0:
             # For CFG, prompt_embeds contains [uncond, cond] concatenated
-            batch_size = self.stream.batch_size // 2 if self.stream.cfg_type == "full" else self.stream.batch_size
+            # In full CFG mode, stream.batch_size already represents the conditional batch.
+            # The final embedding batch must be [uncond(batch_size), cond(batch_size)] => 2 * batch_size.
+            batch_size = self.stream.batch_size if self.stream.cfg_type == "full" else self.stream.batch_size
 
             # Get unconditional embeddings (empty prompt)
             uncond_output = self.stream.pipe.encode_prompt(
@@ -875,7 +877,41 @@ class StreamParameterUpdater(OrchestratorUser):
         ).to(device=self.stream.device, dtype=self.stream.dtype)
 
         self.stream.stock_noise = torch.zeros_like(self.stream.init_noise)
-        self.stream.prompt_embeds = self.stream.prompt_embeds[0].repeat(self.stream.batch_size, 1, 1)
+
+        # Prompt embeddings depend on effective UNet batch. When denoising-step length changes,
+        # regenerate embeddings from cached prompt state (preferred) or resize existing embeddings.
+        if self._current_prompt_list:
+            self._apply_prompt_blending("linear")
+        else:
+            old_prompt_embeds = getattr(self.stream, "prompt_embeds", None)
+            if isinstance(old_prompt_embeds, torch.Tensor) and old_prompt_embeds.ndim == 3 and old_num_steps > 0:
+                old_prompt_batch = int(old_prompt_embeds.shape[0])
+                old_stream_batch = int(old_batch_size)
+
+                # Preserve historical prompt batch multiplier when possible:
+                # - 1x for no-CFG
+                # - 2x for CFG full
+                if old_stream_batch > 0 and old_prompt_batch % old_stream_batch == 0:
+                    prompt_multiplier = max(1, old_prompt_batch // old_stream_batch)
+                elif self.stream.guidance_scale > 1.0 and self.stream.cfg_type == "full":
+                    prompt_multiplier = 2
+                else:
+                    prompt_multiplier = 1
+
+                if prompt_multiplier == 2 and old_prompt_batch >= 2:
+                    # Treat first embedding as uncond and first cond embedding as cond anchor.
+                    split_idx = min(old_stream_batch, old_prompt_batch - 1)
+                    uncond_anchor = old_prompt_embeds[0:1]
+                    cond_anchor = old_prompt_embeds[split_idx:split_idx + 1]
+                    self.stream.prompt_embeds = torch.cat(
+                        [
+                            uncond_anchor.repeat(self.stream.batch_size, 1, 1),
+                            cond_anchor.repeat(self.stream.batch_size, 1, 1),
+                        ],
+                        dim=0,
+                    )
+                else:
+                    self.stream.prompt_embeds = old_prompt_embeds[0:1].repeat(self.stream.batch_size, 1, 1)
 
         # Resize kvo_cache tensors if batch size changed
         if self.stream.kvo_cache and old_batch_size != self.stream.batch_size:
@@ -1143,24 +1179,24 @@ class StreamParameterUpdater(OrchestratorUser):
     def _update_controlnet_config(self, desired_config: List[Dict[str, Any]]) -> None:
         """
         Update ControlNet configuration by diffing current vs desired state.
-        
+
         Args:
             desired_config: Complete ControlNet configuration list defining the desired state.
                            Each dict contains: model_id, preprocessor, conditioning_scale, enabled, etc.
         """
-        # Find the ControlNet pipeline/module (module-aware)
         controlnet_pipeline = self._get_controlnet_pipeline()
         if not controlnet_pipeline:
             logger.warning(f"_update_controlnet_config: No ControlNet pipeline found")
             return
-        
-        current_config = self._get_current_controlnet_config()
-        
-        # Simple approach: detect what changed and apply minimal updates
-        current_models = {i: getattr(cn, 'model_id', f'controlnet_{i}') for i, cn in enumerate(controlnet_pipeline.controlnets)}
-        desired_models = {cfg['model_id']: cfg for cfg in desired_config}
-        
-        # Reorder to match desired order (module supports stable reordering)
+
+        def _with_occurrence_keys(model_ids):
+            counts = {}
+            keys = []
+            for mid in model_ids:
+                counts[mid] = counts.get(mid, 0) + 1
+                keys.append(f"{mid}#{counts[mid]}")
+            return keys
+
         try:
             desired_order = [cfg['model_id'] for cfg in desired_config if 'model_id' in cfg]
             if hasattr(controlnet_pipeline, 'reorder_controlnets_by_model_ids'):
@@ -1168,71 +1204,71 @@ class StreamParameterUpdater(OrchestratorUser):
         except Exception:
             pass
 
-        # Recompute current models after potential reorder
-        current_models = {i: getattr(cn, 'model_id', f'controlnet_{i}') for i, cn in enumerate(controlnet_pipeline.controlnets)}
+        current_config = self._get_current_controlnet_config()
+        current_models = [getattr(cn, 'model_id', f'controlnet_{i}') for i, cn in enumerate(controlnet_pipeline.controlnets)]
+        current_keys = _with_occurrence_keys(current_models)
+        desired_models = [cfg.get('model_id') for cfg in desired_config]
+        desired_keys = _with_occurrence_keys(desired_models)
+        desired_key_set = set(desired_keys)
 
-        # Remove controlnets not in desired config
         for i in reversed(range(len(controlnet_pipeline.controlnets))):
-            model_id = current_models.get(i, f'controlnet_{i}')
-            if model_id not in desired_models:
-                logger.info(f"_update_controlnet_config: Removing ControlNet {model_id}")
-                try:
-                    controlnet_pipeline.remove_controlnet(i)
-                except Exception:
-                    raise
-        
-        # Add new controlnets and update existing ones
-        for desired_cfg in desired_config:
-            model_id = desired_cfg['model_id']
-            existing_index = next((i for i, mid in current_models.items() if mid == model_id), None)
-            
-            if existing_index is None:
-                # Add new controlnet
-                logger.info(f"_update_controlnet_config: Adding ControlNet {model_id}")
-                try:
-                    # Prefer module path: construct ControlNetConfig
-                    try:
-                        from .modules.controlnet_module import ControlNetConfig  # type: ignore
-                        cn_cfg = ControlNetConfig(
-                            model_id=desired_cfg.get('model_id'),
-                            preprocessor=desired_cfg.get('preprocessor'),
-                            conditioning_scale=desired_cfg.get('conditioning_scale', 1.0),
-                            enabled=desired_cfg.get('enabled', True),
-                            conditioning_channels=desired_cfg.get('conditioning_channels'),
-                            preprocessor_params=desired_cfg.get('preprocessor_params'),
-                        )
-                        controlnet_pipeline.add_controlnet(cn_cfg, desired_cfg.get('control_image'))
-                    except Exception:
-                        # No fallback
-                        raise
-                except Exception as e:
-                    logger.error(f"_update_controlnet_config: add_controlnet failed for {model_id}: {e}")
-            else:
-                # Update existing controlnet
-                if 'conditioning_scale' in desired_cfg:
-                    current_scale = current_config[existing_index].get('conditioning_scale', 1.0)
-                    desired_scale = desired_cfg['conditioning_scale']
-                    
-                    if current_scale != desired_scale:
-                        logger.info(f"_update_controlnet_config: Updating {model_id} scale: {current_scale} → {desired_scale}")
-                        if hasattr(controlnet_pipeline, 'controlnet_scales') and 0 <= existing_index < len(controlnet_pipeline.controlnet_scales):
-                            controlnet_pipeline.controlnet_scales[existing_index] = float(desired_scale)
-                
-                # Enable/disable toggle
-                if 'enabled' in desired_cfg and hasattr(controlnet_pipeline, 'enabled_list'):
-                    if 0 <= existing_index < len(controlnet_pipeline.enabled_list):
-                        controlnet_pipeline.enabled_list[existing_index] = bool(desired_cfg['enabled'])
+            current_key = current_keys[i] if i < len(current_keys) else f"controlnet_{i}#1"
+            if current_key not in desired_key_set:
+                logger.info(f"_update_controlnet_config: Removing ControlNet {current_key}")
+                controlnet_pipeline.remove_controlnet(i)
 
-                if 'preprocessor_params' in desired_cfg and hasattr(controlnet_pipeline, 'preprocessors') and controlnet_pipeline.preprocessors[existing_index]:
+        current_config = self._get_current_controlnet_config()
+        current_models = [getattr(cn, 'model_id', f'controlnet_{i}') for i, cn in enumerate(controlnet_pipeline.controlnets)]
+        current_keys = _with_occurrence_keys(current_models)
+
+        for desired_pos, desired_cfg in enumerate(desired_config):
+            model_id = desired_cfg['model_id']
+            desired_key = desired_keys[desired_pos] if desired_pos < len(desired_keys) else f"{model_id}#1"
+            existing_index = next((i for i, key in enumerate(current_keys) if key == desired_key), None)
+
+            if existing_index is None:
+                logger.info(f"_update_controlnet_config: Adding ControlNet {desired_key}")
+                try:
+                    from .modules.controlnet_module import ControlNetConfig  # type: ignore
+                    cn_cfg = ControlNetConfig(
+                        model_id=desired_cfg.get('model_id'),
+                        preprocessor=desired_cfg.get('preprocessor'),
+                        conditioning_scale=desired_cfg.get('conditioning_scale', 1.0),
+                        enabled=desired_cfg.get('enabled', True),
+                        conditioning_channels=desired_cfg.get('conditioning_channels'),
+                        preprocessor_params=desired_cfg.get('preprocessor_params'),
+                    )
+                    controlnet_pipeline.add_controlnet(cn_cfg, desired_cfg.get('control_image'))
+                except Exception as e:
+                    logger.error(f"_update_controlnet_config: add_controlnet failed for {desired_key}: {e}")
+                    continue
+
+                current_config = self._get_current_controlnet_config()
+                current_models = [getattr(cn, 'model_id', f'controlnet_{i}') for i, cn in enumerate(controlnet_pipeline.controlnets)]
+                current_keys = _with_occurrence_keys(current_models)
+                existing_index = next((i for i, key in enumerate(current_keys) if key == desired_key), None)
+                if existing_index is None:
+                    continue
+
+            if 'conditioning_scale' in desired_cfg and existing_index < len(current_config):
+                current_scale = current_config[existing_index].get('conditioning_scale', 1.0)
+                desired_scale = desired_cfg['conditioning_scale']
+                if current_scale != desired_scale:
+                    logger.info(f"_update_controlnet_config: Updating {desired_key} scale: {current_scale} -> {desired_scale}")
+                    if hasattr(controlnet_pipeline, 'controlnet_scales') and 0 <= existing_index < len(controlnet_pipeline.controlnet_scales):
+                        controlnet_pipeline.controlnet_scales[existing_index] = float(desired_scale)
+
+            if 'enabled' in desired_cfg and hasattr(controlnet_pipeline, 'enabled_list'):
+                if 0 <= existing_index < len(controlnet_pipeline.enabled_list):
+                    controlnet_pipeline.enabled_list[existing_index] = bool(desired_cfg['enabled'])
+
+            if 'preprocessor_params' in desired_cfg and hasattr(controlnet_pipeline, 'preprocessors'):
+                if 0 <= existing_index < len(controlnet_pipeline.preprocessors) and controlnet_pipeline.preprocessors[existing_index]:
                     preprocessor = controlnet_pipeline.preprocessors[existing_index]
                     preprocessor.params.update(desired_cfg['preprocessor_params'])
                     for param_name, param_value in desired_cfg['preprocessor_params'].items():
                         if hasattr(preprocessor, param_name):
                             setattr(preprocessor, param_name, param_value)
-                
-                # Pipeline references are now automatically managed during preprocessor creation
-                # No need to manually re-establish pipeline references for pipeline-aware processors
-
 
     def _get_controlnet_pipeline(self):
         """
@@ -1307,7 +1343,7 @@ class StreamParameterUpdater(OrchestratorUser):
             current_scale = getattr(self.stream.ipadapter, 'scale', 1.0) if hasattr(self.stream, 'ipadapter') else 1.0
             
             if current_scale != desired_scale:
-                logger.info(f"_update_ipadapter_config: Updating scale: {current_scale} → {desired_scale}")
+                logger.info(f"_update_ipadapter_config: Updating scale: {current_scale} â†’ {desired_scale}")
                 
                 # Get weight_type from IPAdapter instance
                 weight_type = getattr(self.stream.ipadapter, 'weight_type', None) if hasattr(self.stream, 'ipadapter') else None
@@ -1344,7 +1380,7 @@ class StreamParameterUpdater(OrchestratorUser):
             if hasattr(self.stream, 'ipadapter'):
                 current_enabled = getattr(self.stream.ipadapter, 'enabled', True)
                 if current_enabled != enabled_state:
-                    logger.info(f"_update_ipadapter_config: Updating enabled state: {current_enabled} → {enabled_state}")
+                    logger.info(f"_update_ipadapter_config: Updating enabled state: {current_enabled} â†’ {enabled_state}")
                     setattr(self.stream.ipadapter, 'enabled', enabled_state)
 
         # Update weight type if provided (affects per-layer distribution and/or per-step factor)
@@ -1598,4 +1634,5 @@ class StreamParameterUpdater(OrchestratorUser):
             logger.info(f"_update_hook_config: Removed extra processor {removed_idx}: {removed_processor.__class__.__name__}")
         
         logger.info(f"_update_hook_config: Finished updating {hook_type}, now has {len(hook_module.processors)} processors")
+
 

@@ -195,7 +195,7 @@ def _prepare_controlnet_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             'conditioning_scale': cn_config.get('conditioning_scale', 1.0),
             'enabled': cn_config.get('enabled', True),
             'preprocessor_params': cn_config.get('preprocessor_params'),
-            'conditioning_channels': cn_config.get('conditioning_channels'),
+            'conditioning_channels': cn_config.get('conditioning_channels', 3),
             'pipeline_type': pipeline_type,
             'control_guidance_start': cn_config.get('control_guidance_start', 0.0),
             'control_guidance_end': cn_config.get('control_guidance_end', 1.0),

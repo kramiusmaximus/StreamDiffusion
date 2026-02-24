@@ -1444,6 +1444,7 @@ class StreamDiffusionWrapper:
                     ipadapter_scale=ipadapter_scale,
                     ipadapter_tokens=ipadapter_tokens,
                     is_faceid=is_faceid if use_ipadapter_trt else None,
+                    use_controlnet=use_controlnet_trt,
                     use_cached_attn=use_cached_attn,
                 )
                 vae_encoder_path = engine_manager.get_engine_path(

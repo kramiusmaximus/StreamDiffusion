@@ -270,6 +270,15 @@ class Engine:
             self.context = self.engine.create_execution_context()
 
     def allocate_buffers(self, shape_dict=None, device="cuda"):
+        # Ensure execution context is available (can be None after failed init or cleanup)
+        if self.context is None:
+            try:
+                self.activate()
+            except Exception as e:
+                raise RuntimeError(f"TensorRT Engine: failed to activate execution context: {e}") from e
+            if self.context is None:
+                raise RuntimeError("TensorRT Engine: execution context is None after activate()")
+
         # Check if we can reuse existing buffers (OPTIMIZATION)
         if self._can_reuse_buffers(shape_dict, device):
             return

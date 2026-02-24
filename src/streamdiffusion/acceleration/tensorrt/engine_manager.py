@@ -105,6 +105,7 @@ class EngineManager:
                        ipadapter_tokens: Optional[int] = None,
                        controlnet_model_id: Optional[str] = None,
                        is_faceid: Optional[bool] = None,
+                       use_controlnet: Optional[bool] = None,
                        use_cached_attn: bool = False
                        ) -> Path:
         """
@@ -125,7 +126,7 @@ class EngineManager:
             
             # Use ControlNetEnginePool naming convention: dynamic engines with 384-1024 range
             prefix = f"controlnet_{model_dir_name}--min_batch-{min_batch_size}--max_batch-{max_batch_size}--dyn-384-1024"
-            return self.engine_dir / prefix / filename
+            return self.engine_dir / "preprocessors" / prefix / filename
         else:
             # Standard engines use the unified prefix format
             # Extract base name (from wrapper.py lines 1002-1003)
@@ -147,6 +148,8 @@ class EngineManager:
                 prefix += f"--lora-{self._lora_signature(lora_dict)}"
 
             if engine_type == EngineType.UNET:
+                if use_controlnet:
+                    prefix += "--cn"
                 prefix += f"--use_cached_attn-{use_cached_attn}"
             
             prefix += f"--mode-{mode}"

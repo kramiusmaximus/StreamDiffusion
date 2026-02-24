@@ -65,6 +65,7 @@ class ControlNetModule(OrchestratorUser):
         # SDXL-specific caching for performance optimization
         self._sdxl_conditioning_cache: Optional[Dict[str, torch.Tensor]] = None
         self._sdxl_conditioning_valid: bool = False
+        self._sdxl_conditioning_device: Optional[torch.device] = None
         
         # Cache engine type detection to avoid repeated hasattr calls
         self._engine_type_cache: Dict[str, bool] = {}
@@ -141,6 +142,9 @@ class ControlNetModule(OrchestratorUser):
             self._images_version += 1
             # Invalidate SDXL conditioning cache when ControlNet configuration changes
             self._sdxl_conditioning_valid = False
+            # Force TRT engine map rebuild on next hook call
+            self._engines_cache_valid = False
+            self._engine_type_cache.clear()
 
     def update_control_image_efficient(self, control_image: Union[str, Any, torch.Tensor], index: Optional[int] = None) -> None:
         if self._preprocessing_orchestrator is None:
@@ -232,6 +236,9 @@ class ControlNetModule(OrchestratorUser):
                 self._images_version += 1
                 # Invalidate SDXL conditioning cache
                 self._sdxl_conditioning_valid = False
+                # Force TRT engine map rebuild on next hook call
+                self._engines_cache_valid = False
+                self._engine_type_cache.clear()
 
     def reorder_controlnets_by_model_ids(self, desired_model_ids: List[str]) -> None:
         """Reorder internal collections to match the desired model_id order.
@@ -270,6 +277,9 @@ class ControlNetModule(OrchestratorUser):
             self.controlnet_scales = reindex(self.controlnet_scales)
             self.preprocessors = reindex(self.preprocessors)
             self.enabled_list = reindex(self.enabled_list)
+            # Force TRT engine map rebuild after order changes
+            self._engines_cache_valid = False
+            self._engine_type_cache.clear()
 
     def get_current_config(self) -> List[Dict[str, Any]]:
         cfg: List[Dict[str, Any]] = []
@@ -345,11 +355,16 @@ class ControlNetModule(OrchestratorUser):
             # Verify batch size matches current context
             if ('text_embeds' in cached and 
                 cached['text_embeds'].shape[0] == ctx.x_t_latent.shape[0]):
-                return cached
+                # Ensure cached tensors are on the current device
+                if self._sdxl_conditioning_device == ctx.x_t_latent.device:
+                    return cached
+                # Device mismatch -> invalidate cache
+                self._sdxl_conditioning_valid = False
         
         # Cache miss or invalid - prepare new conditioning
         try:
             conditioning = {}
+            device = ctx.x_t_latent.device
             if 'text_embeds' in ctx.sdxl_cond:
                 text_embeds = ctx.sdxl_cond['text_embeds']
                 batch_size = ctx.x_t_latent.shape[0]
@@ -362,6 +377,7 @@ class ControlNetModule(OrchestratorUser):
                         conditioning['text_embeds'] = text_embeds[:batch_size]
                 else:
                     conditioning['text_embeds'] = text_embeds
+                conditioning['text_embeds'] = conditioning['text_embeds'].to(device=device)
             
             if 'time_ids' in ctx.sdxl_cond:
                 time_ids = ctx.sdxl_cond['time_ids']
@@ -375,10 +391,12 @@ class ControlNetModule(OrchestratorUser):
                         conditioning['time_ids'] = time_ids[:batch_size]
                 else:
                     conditioning['time_ids'] = time_ids
+                conditioning['time_ids'] = conditioning['time_ids'].to(device=device)
             
             # Cache the prepared conditioning
             self._sdxl_conditioning_cache = conditioning
             self._sdxl_conditioning_valid = True
+            self._sdxl_conditioning_device = device
             return conditioning
             
         except Exception:
@@ -391,6 +409,8 @@ class ControlNetModule(OrchestratorUser):
             # Compute residuals under lock, using only original text tokens for ControlNet encoding
             x_t = ctx.x_t_latent
             t_list = ctx.t_list
+            if isinstance(t_list, torch.Tensor) and t_list.device != x_t.device:
+                t_list = t_list.to(device=x_t.device)
 
             with self._collections_lock:
                 if not self.controlnets:
@@ -430,6 +450,9 @@ class ControlNetModule(OrchestratorUser):
                     self._is_sdxl = False
 
             encoder_hidden_states = self._stream.prompt_embeds[:, :self._expected_text_len, :]
+            if isinstance(encoder_hidden_states, torch.Tensor):
+                if encoder_hidden_states.device != x_t.device or encoder_hidden_states.dtype != x_t.dtype:
+                    encoder_hidden_states = encoder_hidden_states.to(device=x_t.device, dtype=x_t.dtype)
 
             base_kwargs: Dict[str, Any] = {
                 'sample': x_t,
@@ -494,6 +517,14 @@ class ControlNetModule(OrchestratorUser):
                                 conditioning_scale=float(scale)
                             )
                     else:
+                        # Lazy device placement for PyTorch fallback path only.
+                        # This keeps VRAM lower when TRT engines are active.
+                        try:
+                            param = next(cn.parameters())
+                            if param.device != x_t.device or param.dtype != x_t.dtype:
+                                cn = cn.to(device=x_t.device, dtype=x_t.dtype)
+                        except Exception:
+                            pass
                         # PyTorch ControlNet path
                         if added_cond_kwargs:
                             down_samples, mid_sample = cn(
@@ -619,6 +650,9 @@ class ControlNetModule(OrchestratorUser):
                     )
                 else:
                     controlnet = ControlNetModel.from_pretrained(model_id, **load_kwargs)
+            # Keep PyTorch ControlNet on host memory by default.
+            # If TRT engines are available, this avoids duplicating large model weights in VRAM.
+            # If PyTorch fallback is used, the model is moved lazily in the hook.
             controlnet = controlnet.to(dtype=self.dtype)
             # Track model_id for updater diffing
             try:

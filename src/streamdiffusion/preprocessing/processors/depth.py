@@ -65,11 +65,39 @@ class DepthPreprocessor(BasePreprocessor):
         if self._depth_estimator is None:
             model_name = self.params.get('model_name', 'Intel/dpt-large')
             print(f"Loading depth estimation model: {model_name}")
-            self._depth_estimator = pipeline(
-                'depth-estimation', 
-                model=model_name,
-                device=0 if torch.cuda.is_available() else -1
-            )
+            pipeline_kwargs = {
+                "device": 0 if torch.cuda.is_available() else -1,
+            }
+
+            # Prefer fast image processor for speed; fall back gracefully for older versions.
+            try:
+                from transformers import AutoImageProcessor
+                try:
+                    pipeline_kwargs["image_processor"] = AutoImageProcessor.from_pretrained(
+                        model_name,
+                        use_fast=True,
+                    )
+                except TypeError:
+                    # Older Transformers without use_fast.
+                    pipeline_kwargs["image_processor"] = AutoImageProcessor.from_pretrained(model_name)
+            except Exception:
+                # If AutoImageProcessor isn't available, attempt use_fast via pipeline.
+                pipeline_kwargs["use_fast"] = True
+
+            try:
+                self._depth_estimator = pipeline(
+                    "depth-estimation",
+                    model=model_name,
+                    **pipeline_kwargs,
+                )
+            except TypeError:
+                # Some pipeline versions don't accept use_fast.
+                pipeline_kwargs.pop("use_fast", None)
+                self._depth_estimator = pipeline(
+                    "depth-estimation",
+                    model=model_name,
+                    **pipeline_kwargs,
+                )
         return self._depth_estimator
     
     def _process_core(self, image: Image.Image) -> Image.Image:
