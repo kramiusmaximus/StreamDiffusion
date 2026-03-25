@@ -1197,6 +1197,74 @@ class StreamParameterUpdater(OrchestratorUser):
                 keys.append(f"{mid}#{counts[mid]}")
             return keys
 
+        def _merge_controlnet_entry(base_cfg: Dict[str, Any], patch_cfg: Dict[str, Any]) -> Dict[str, Any]:
+            merged = dict(base_cfg or {})
+            merged.update(patch_cfg or {})
+
+            base_params = (base_cfg or {}).get('preprocessor_params') or {}
+            patch_params = (patch_cfg or {}).get('preprocessor_params') or {}
+            if base_params or patch_params:
+                merged['preprocessor_params'] = {**base_params, **patch_params}
+
+            return merged
+
+        def _normalize_desired_config(
+            raw_desired_config: List[Dict[str, Any]],
+            current_cfg: List[Dict[str, Any]],
+        ) -> List[Dict[str, Any]]:
+            if not raw_desired_config:
+                return []
+
+            # Broadcast-style updates from OSC (for example /use_controlnet disable) often arrive
+            # without model_ids. Apply them as patches to the current full config instead of treating
+            # them as a destructive full replacement.
+            if any(not cfg.get('model_id') for cfg in raw_desired_config):
+                if not current_cfg:
+                    return raw_desired_config
+
+                if len(raw_desired_config) == 1 and not raw_desired_config[0].get('model_id'):
+                    patch_cfg = raw_desired_config[0]
+                    return [_merge_controlnet_entry(cfg, patch_cfg) for cfg in current_cfg]
+
+                merged_cfg = [dict(cfg) for cfg in current_cfg]
+                for idx, patch_cfg in enumerate(raw_desired_config):
+                    if idx < len(merged_cfg):
+                        merged_cfg[idx] = _merge_controlnet_entry(merged_cfg[idx], patch_cfg)
+                    else:
+                        merged_cfg.append(dict(patch_cfg))
+                return merged_cfg
+
+            current_keys_local = _with_occurrence_keys([cfg.get('model_id') for cfg in current_cfg])
+            current_by_key = {
+                key: current_cfg[idx]
+                for idx, key in enumerate(current_keys_local)
+                if idx < len(current_cfg)
+            }
+
+            desired_counts = {}
+            desired_key_set = set()
+            normalized_cfg: List[Dict[str, Any]] = []
+
+            for patch_cfg in raw_desired_config:
+                model_id = patch_cfg.get('model_id')
+                desired_counts[model_id] = desired_counts.get(model_id, 0) + 1
+                desired_key = f"{model_id}#{desired_counts[model_id]}"
+                desired_key_set.add(desired_key)
+                normalized_cfg.append(
+                    _merge_controlnet_entry(current_by_key.get(desired_key, {}), patch_cfg)
+                )
+
+            # Preserve current ControlNets when OSC sends a partial model-id keyed patch list.
+            if len(raw_desired_config) < len(current_cfg):
+                for idx, current_key in enumerate(current_keys_local):
+                    if current_key not in desired_key_set and idx < len(current_cfg):
+                        normalized_cfg.append(dict(current_cfg[idx]))
+
+            return normalized_cfg
+
+        current_config = self._get_current_controlnet_config()
+        desired_config = _normalize_desired_config(desired_config, current_config)
+
         try:
             desired_order = [cfg['model_id'] for cfg in desired_config if 'model_id' in cfg]
             if hasattr(controlnet_pipeline, 'reorder_controlnets_by_model_ids'):
@@ -1306,6 +1374,27 @@ class StreamParameterUpdater(OrchestratorUser):
         for i, controlnet in enumerate(controlnet_pipeline.controlnets):
             model_id = getattr(controlnet, 'model_id', f'controlnet_{i}')
             scale = controlnet_pipeline.controlnet_scales[i] if hasattr(controlnet_pipeline, 'controlnet_scales') and i < len(controlnet_pipeline.controlnet_scales) else 1.0
+            preprocessor_name = None
+            preprocessor_params: Dict[str, Any] = {}
+
+            if hasattr(controlnet_pipeline, 'preprocessors') and i < len(controlnet_pipeline.preprocessors):
+                preprocessor = controlnet_pipeline.preprocessors[i]
+                if preprocessor is not None:
+                    raw_params = getattr(preprocessor, 'params', {}) or {}
+                    preprocessor_name = raw_params.get('_requested_preprocessor') or raw_params.get('_registry_name')
+                    preprocessor_params = {
+                        key: value
+                        for key, value in raw_params.items()
+                        if key not in {
+                            'pipeline_ref',
+                            'normalization_context',
+                            '_registry_name',
+                            '_requested_preprocessor',
+                            'device',
+                            'dtype',
+                        }
+                    }
+
             enabled_val = True
             try:
                 if hasattr(controlnet_pipeline, 'enabled_list') and i < len(controlnet_pipeline.enabled_list):
@@ -1315,7 +1404,8 @@ class StreamParameterUpdater(OrchestratorUser):
             config = {
                 'model_id': model_id,
                 'conditioning_scale': scale,
-                'preprocessor_params': getattr(controlnet_pipeline.preprocessors[i], 'params', {}) if hasattr(controlnet_pipeline, 'preprocessors') and controlnet_pipeline.preprocessors[i] else {},
+                'preprocessor': preprocessor_name,
+                'preprocessor_params': preprocessor_params,
                 'enabled': enabled_val,
             }
             current_config.append(config)

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple, Any
 from enum import Enum
+import math
 import torch
 
 from streamdiffusion.hooks import EmbedsCtx, EmbeddingHook, StepCtx, UnetKwargsDelta, UnetHook
@@ -51,6 +52,18 @@ class IPAdapterModule(OrchestratorUser):
         self.config = config
         self.ipadapter: Optional[Any] = None
 
+    def _match_batch_size(self, tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Repeat or trim cached image-token tensors to exactly match the current stream batch."""
+        current_batch = tensor.shape[0]
+        if current_batch == batch_size:
+            return tensor
+        if current_batch <= 0:
+            raise ValueError("IPAdapterModule._match_batch_size: tensor batch dimension must be > 0")
+
+        repeat_factor = int(math.ceil(batch_size / float(current_batch)))
+        repeat_dims = (repeat_factor,) + (1,) * (tensor.dim() - 1)
+        return tensor.repeat(*repeat_dims)[:batch_size]
+
     def build_embedding_hook(self, stream) -> EmbeddingHook:
         style_key = self.config.style_image_key or "default"
         num_tokens = int(self.config.num_image_tokens)
@@ -81,8 +94,8 @@ class IPAdapterModule(OrchestratorUser):
             if image_prompt_tokens is not None:
                 # Repeat to match batch size if needed
                 if image_prompt_tokens.shape[0] != prompt_with_image.shape[0]:
-                    image_prompt_tokens = image_prompt_tokens.repeat_interleave(
-                        repeats=prompt_with_image.shape[0] // max(image_prompt_tokens.shape[0], 1), dim=0
+                    image_prompt_tokens = self._match_batch_size(
+                        image_prompt_tokens, prompt_with_image.shape[0]
                     )
                 prompt_with_image = torch.cat([prompt_with_image, image_prompt_tokens], dim=1)
 
@@ -94,8 +107,8 @@ class IPAdapterModule(OrchestratorUser):
                     )
                 else:
                     if image_negative_tokens.shape[0] != neg_with_image.shape[0]:
-                        image_negative_tokens = image_negative_tokens.repeat_interleave(
-                            repeats=neg_with_image.shape[0] // max(image_negative_tokens.shape[0], 1), dim=0
+                        image_negative_tokens = self._match_batch_size(
+                            image_negative_tokens, neg_with_image.shape[0]
                         )
                 neg_with_image = torch.cat([neg_with_image, image_negative_tokens], dim=1)
 

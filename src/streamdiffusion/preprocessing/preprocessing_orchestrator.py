@@ -309,6 +309,30 @@ class PreprocessingOrchestrator(BaseOrchestrator[ControlImage, List[Optional[tor
         
         self._last_input_frame = control_image
         self.clear_cache()
+
+        # Pipeline-aware preprocessors such as feedback depend on ordered access to
+        # stream state. Even on the "sync" path, running them through the thread pool
+        # can leave some results unset, so process them sequentially.
+        if self._check_pipeline_aware_cached(preprocessors):
+            processed_images = [None] * len(preprocessors)
+            for i, scale in enumerate(scales):
+                if scale <= 0:
+                    continue
+                try:
+                    processed_images[i] = self.prepare_control_image(
+                        control_image,
+                        preprocessors[i],
+                        stream_width,
+                        stream_height,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "PreprocessingOrchestrator: Sequential preprocessor %s at index %s failed: %s",
+                        type(preprocessors[i]).__name__ if preprocessors[i] is not None else "None",
+                        i,
+                        e,
+                    )
+            return processed_images
         
         # Prepare input variants for optimal processing
         control_variants = self._prepare_input_variants(control_image, stream_width, stream_height)

@@ -91,9 +91,10 @@ class ControlNetUNetExportWrapper(torch.nn.Module):
             'sample': sample,
             'timestep': timestep,
             'encoder_hidden_states': encoder_hidden_states,
-            'kvo_cache': formatted_kvo_cache,
             'return_dict': False,
         }
+        if len(kvo_cache) > 0:
+            unet_kwargs['kvo_cache'] = formatted_kvo_cache
         
         # Pass through all additional kwargs (for SDXL models)
         unet_kwargs.update(kwargs)
@@ -275,9 +276,10 @@ class MultiControlNetUNetExportWrapper(torch.nn.Module):
             'sample': sample,
             'timestep': timestep,
             'encoder_hidden_states': encoder_hidden_states,
-            'kvo_cache': formatted_kvo_cache,
             'return_dict': False,
         }
+        if len(kvo_cache) > 0:
+            unet_kwargs['kvo_cache'] = formatted_kvo_cache
         
         if combined_down_controls:
             unet_kwargs['down_block_additional_residuals'] = list(reversed(combined_down_controls))

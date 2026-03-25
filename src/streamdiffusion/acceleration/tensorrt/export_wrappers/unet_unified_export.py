@@ -53,9 +53,10 @@ class UnifiedExportWrapper(torch.nn.Module):
             'timestep': timestep,
             'encoder_hidden_states': encoder_hidden_states,
             'return_dict': False,
-            'kvo_cache': formatted_kvo_cache,
             **kwargs  # Pass through all additional parameters (SDXL, future model types, etc.)
         }
+        if len(kvo_cache) > 0:
+            unet_kwargs['kvo_cache'] = formatted_kvo_cache
         res = self.unet(**unet_kwargs)
         if len(kvo_cache) > 0:
             return res

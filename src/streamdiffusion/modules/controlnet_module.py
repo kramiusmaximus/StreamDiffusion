@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import threading
+import math
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -13,6 +16,8 @@ from streamdiffusion.preprocessing.preprocessing_orchestrator import (
     PreprocessingOrchestrator,
 )
 from streamdiffusion.preprocessing.orchestrator_user import OrchestratorUser
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -54,6 +59,7 @@ class ControlNetModule(OrchestratorUser):
         self._prepared_device: Optional[torch.device] = None
         self._prepared_dtype: Optional[torch.dtype] = None
         self._prepared_batch: Optional[int] = None
+        self._prepared_images_version: int = -1
         self._images_version: int = 0
         
         # Cache expensive lookups to avoid repeated hasattr/getattr calls
@@ -69,6 +75,12 @@ class ControlNetModule(OrchestratorUser):
         
         # Cache engine type detection to avoid repeated hasattr calls
         self._engine_type_cache: Dict[str, bool] = {}
+        self._allow_trt_controlnet_runtime = os.getenv(
+            "STREAMDIFFUSION_ENABLE_TRT_CONTROLNET_RUNTIME", ""
+        ).lower() in ("1", "true", "yes", "on")
+        self._logged_trt_runtime_disabled = False
+        self._last_debug_log_time = 0.0
+        self._last_image_debug_log_time = 0.0
 
     # ---------- Public API (used by wrapper in a later step) ----------
     def install(self, stream) -> None:
@@ -87,6 +99,7 @@ class ControlNetModule(OrchestratorUser):
         self._prepared_device = None
         self._prepared_dtype = None
         self._prepared_batch = None
+        self._prepared_images_version = -1
         # Invalidate caches on install
         self._engines_cache_valid = False
         self._is_sdxl = None
@@ -208,6 +221,30 @@ class ControlNetModule(OrchestratorUser):
             # Invalidate SDXL conditioning cache
             self._sdxl_conditioning_valid = False
             self.prepare_frame_tensors(self.device, self.dtype, 1)
+            if logger.isEnabledFor(logging.DEBUG):
+                now = time.time()
+                if now - self._last_image_debug_log_time >= 2.0:
+                    image_rows = []
+                    for i, (cn, img, scale) in enumerate(zip(self.controlnets, self.controlnet_images, self.controlnet_scales)):
+                        model_id = getattr(cn, 'model_id', f'controlnet_{i}') if cn is not None else f'controlnet_{i}'
+                        enabled = self.enabled_list[i] if i < len(self.enabled_list) else True
+                        image_rows.append(
+                            f"{model_id}: enabled={bool(enabled)} scale={float(scale):.3f} "
+                            f"image={'None' if img is None else tuple(img.shape)}"
+                        )
+                    logger.debug("ControlNetModule: cached control images | %s", " | ".join(image_rows))
+                    self._last_image_debug_log_time = now
+                result_rows = []
+                for i, img in enumerate(processed_images):
+                    model_id = (
+                        getattr(self.controlnets[i], 'model_id', f'controlnet_{i}')
+                        if i < len(self.controlnets) and self.controlnets[i] is not None
+                        else f'controlnet_{i}'
+                    )
+                    result_rows.append(
+                        f"{model_id}: result={'None' if img is None else tuple(img.shape)}"
+                    )
+                logger.debug("ControlNetModule: preprocess update results | %s", " | ".join(result_rows))
 
     def update_controlnet_scale(self, index: int, scale: float) -> None:
         with self._collections_lock:
@@ -313,6 +350,7 @@ class ControlNetModule(OrchestratorUser):
                 self._prepared_device == device and
                 self._prepared_dtype == dtype and
                 self._prepared_batch == batch_size and
+                self._prepared_images_version == self._images_version and
                 len(self._prepared_tensors) == len(self.controlnet_images)
             )
             
@@ -329,11 +367,7 @@ class ControlNetModule(OrchestratorUser):
                 # Prepare tensor with correct batch size
                 prepared = img
                 if prepared.dim() == 4 and prepared.shape[0] != batch_size:
-                    if prepared.shape[0] == 1:
-                        prepared = prepared.repeat(batch_size, 1, 1, 1)
-                    else:
-                        repeat_factor = max(1, batch_size // prepared.shape[0])
-                        prepared = prepared.repeat(repeat_factor, 1, 1, 1)[:batch_size]
+                    prepared = self._match_batch_size(prepared, batch_size)
                 
                 # Move to correct device and dtype
                 prepared = prepared.to(device=device, dtype=dtype)
@@ -343,6 +377,28 @@ class ControlNetModule(OrchestratorUser):
             self._prepared_device = device
             self._prepared_dtype = dtype
             self._prepared_batch = batch_size
+            self._prepared_images_version = self._images_version
+
+    def _match_batch_size(self, tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """
+        Expand or trim a batched tensor to exactly match the requested batch size.
+
+        Some runtime paths produce cached tensors with batch sizes other than 1.
+        Using ceil-based repetition avoids leaving the tensor too short when the
+        source batch is smaller than the target but not equal to 1.
+        """
+        if tensor.dim() == 0:
+            return tensor
+
+        current_batch = tensor.shape[0]
+        if current_batch == batch_size:
+            return tensor
+        if current_batch <= 0:
+            raise ValueError("ControlNetModule._match_batch_size: tensor batch dimension must be > 0")
+
+        repeat_factor = int(math.ceil(batch_size / float(current_batch)))
+        repeat_dims = (repeat_factor,) + (1,) * (tensor.dim() - 1)
+        return tensor.repeat(*repeat_dims)[:batch_size]
 
     def _get_cached_sdxl_conditioning(self, ctx: 'StepCtx') -> Optional[Dict[str, torch.Tensor]]:
         """Get cached SDXL conditioning to avoid repeated preparation"""
@@ -371,10 +427,7 @@ class ControlNetModule(OrchestratorUser):
                 
                 # Optimize batch expansion for SDXL text embeddings
                 if text_embeds.shape[0] != batch_size:
-                    if text_embeds.shape[0] == 1:
-                        conditioning['text_embeds'] = text_embeds.repeat(batch_size, 1)
-                    else:
-                        conditioning['text_embeds'] = text_embeds[:batch_size]
+                    conditioning['text_embeds'] = self._match_batch_size(text_embeds, batch_size)
                 else:
                     conditioning['text_embeds'] = text_embeds
                 conditioning['text_embeds'] = conditioning['text_embeds'].to(device=device)
@@ -385,10 +438,7 @@ class ControlNetModule(OrchestratorUser):
                 
                 # Optimize batch expansion for SDXL time IDs
                 if time_ids.shape[0] != batch_size:
-                    if time_ids.shape[0] == 1:
-                        conditioning['time_ids'] = time_ids.repeat(batch_size, 1)
-                    else:
-                        conditioning['time_ids'] = time_ids[:batch_size]
+                    conditioning['time_ids'] = self._match_batch_size(time_ids, batch_size)
                 else:
                     conditioning['time_ids'] = time_ids
                 conditioning['time_ids'] = conditioning['time_ids'].to(device=device)
@@ -420,24 +470,50 @@ class ControlNetModule(OrchestratorUser):
                 active_data = []
                 enabled_flags = self.enabled_list if len(self.enabled_list) == len(self.controlnets) else None
                 
+                inactive_rows: List[str] = []
                 for i, (cn, img, scale) in enumerate(zip(self.controlnets, self.controlnet_images, self.controlnet_scales)):
-                    if cn is not None and img is not None and scale > 0:
-                        enabled = enabled_flags[i] if enabled_flags else True
-                        if enabled:
-                            active_data.append((cn, img, scale, i))
+                    enabled = enabled_flags[i] if enabled_flags else True
+                    if cn is not None and img is not None and scale > 0 and enabled:
+                        active_data.append((cn, img, scale, i))
+                    elif logger.isEnabledFor(logging.DEBUG):
+                        model_id = getattr(cn, 'model_id', f'controlnet_{i}') if cn is not None else f'controlnet_{i}'
+                        inactive_rows.append(
+                            f"{model_id}: enabled={bool(enabled)} scale={float(scale):.3f} "
+                            f"image={'None' if img is None else tuple(img.shape)} cn={'ok' if cn is not None else 'None'}"
+                        )
 
                 if not active_data:
+                    if inactive_rows:
+                        now = time.time()
+                        if now - self._last_debug_log_time >= 2.0:
+                            logger.debug("ControlNetModule: no active controlnets | %s", " | ".join(inactive_rows))
+                            self._last_debug_log_time = now
                     return UnetKwargsDelta()
 
-            # Cache TRT engines lookup to avoid rebuilding every frame
+            # Cache TRT engines lookup to avoid rebuilding every frame.
+            # Default to the PyTorch ControlNet path unless explicitly enabled.
             if not self._engines_cache_valid:
                 self._engines_by_id.clear()
                 try:
-                    if hasattr(self._stream, 'controlnet_engines') and isinstance(self._stream.controlnet_engines, list):
+                    has_trt_controlnets = (
+                        hasattr(self._stream, 'controlnet_engines') and
+                        isinstance(self._stream.controlnet_engines, list) and
+                        len(self._stream.controlnet_engines) > 0
+                    )
+
+                    if has_trt_controlnets and not self._allow_trt_controlnet_runtime:
+                        if not self._logged_trt_runtime_disabled:
+                            logger.info(
+                                "ControlNetModule: using PyTorch ControlNet runtime; "
+                                "set STREAMDIFFUSION_ENABLE_TRT_CONTROLNET_RUNTIME=1 to re-enable TensorRT ControlNet engines."
+                            )
+                            self._logged_trt_runtime_disabled = True
+                    elif has_trt_controlnets:
                         for eng in self._stream.controlnet_engines:
                             mid = getattr(eng, 'model_id', None)
                             if mid:
                                 self._engines_by_id[mid] = eng
+
                     self._engines_cache_valid = True
                 except Exception:
                     pass
@@ -463,6 +539,7 @@ class ControlNetModule(OrchestratorUser):
 
             down_samples_list: List[List[torch.Tensor]] = []
             mid_samples_list: List[torch.Tensor] = []
+            debug_rows: List[str] = []
 
             # Ensure tensors are prepared for this frame
             # This should have been called earlier, but we call it here as a safety net
@@ -561,9 +638,35 @@ class ControlNetModule(OrchestratorUser):
                     continue
                 down_samples_list.append(down_samples)
                 mid_samples_list.append(mid_sample)
+                if logger.isEnabledFor(logging.DEBUG):
+                    try:
+                        down_norm = sum(sample.detach().float().abs().mean().item() for sample in down_samples)
+                        mid_norm = mid_sample.detach().float().abs().mean().item()
+                        debug_rows.append(
+                            f"{getattr(cn, 'model_id', f'controlnet_{idx_i}')}:"
+                            f" scale={float(scale):.3f}"
+                            f" img={tuple(current_img.shape)}"
+                            f" down={down_norm:.5f}"
+                            f" mid={mid_norm:.5f}"
+                        )
+                    except Exception:
+                        pass
 
             if not down_samples_list:
                 return UnetKwargsDelta()
+
+            if debug_rows:
+                now = time.time()
+                if now - self._last_debug_log_time >= 2.0:
+                    if 'inactive_rows' in locals() and inactive_rows:
+                        logger.debug(
+                            "ControlNetModule: active residuals | %s || inactive | %s",
+                            " | ".join(debug_rows),
+                            " | ".join(inactive_rows),
+                        )
+                    else:
+                        logger.debug("ControlNetModule: active residuals | %s", " | ".join(debug_rows))
+                    self._last_debug_log_time = now
 
             if len(down_samples_list) == 1:
                 return UnetKwargsDelta(
