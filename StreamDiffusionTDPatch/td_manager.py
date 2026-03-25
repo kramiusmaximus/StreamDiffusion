@@ -11,7 +11,7 @@ import time
 import platform
 import threading
 import logging
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Optional, Union, List
 from multiprocessing import shared_memory
 import numpy as np
 import torch
@@ -134,9 +134,8 @@ class TouchDesignerManager:
                            'prompt_list', 'negative_prompt', 'prompt_interpolation_method', 'normalize_prompt_weights',
                            'seed_list', 'seed_interpolation_method', 'normalize_seed_weights',
                            'controlnet_config', 'ipadapter_config', 'image_preprocessing_config',
-                           'image_postprocessing_config', 'latent_preprocessing_config',
-                           'latent_postprocessing_config', 'use_safety_checker', 'safety_checker_threshold',
-                           'cache_maxframes', 'cache_interval']
+                           'image_postprocessing_config', 'latent_preprocessing_config', 
+                           'latent_postprocessing_config', 'use_safety_checker', 'safety_checker_threshold']
             
             filtered_params = {k: v for k, v in params.items() if k in valid_params}
 
@@ -629,6 +628,47 @@ class TouchDesignerManager:
 
         except Exception as e:
             logger.error(f"Error sending processed ControlNet frame: {e}")
+
+    def _compose_processed_controlnet_preview(
+        self,
+        processed_tensors: List[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Compose multiple processed ControlNet previews into one frame for TD."""
+        valid_tensors: List[torch.Tensor] = []
+        for tensor in processed_tensors:
+            if tensor is None:
+                continue
+            if tensor.dim() == 3:
+                tensor = tensor.unsqueeze(0)
+            if tensor.dim() == 4 and tensor.shape[0] > 1:
+                tensor = tensor[:1]
+            if tensor.dim() == 4:
+                valid_tensors.append(tensor)
+
+        if not valid_tensors:
+            return None
+        if len(valid_tensors) == 1:
+            return valid_tensors[0]
+
+        base = valid_tensors[0]
+        _, channels, height, width = base.shape
+        count = len(valid_tensors)
+        canvas = torch.zeros((1, channels, height, width), device=base.device, dtype=base.dtype)
+
+        x_start = 0
+        for idx, tensor in enumerate(valid_tensors):
+            x_end = width if idx == count - 1 else round((idx + 1) * width / count)
+            tile_width = max(1, x_end - x_start)
+            resized = torch.nn.functional.interpolate(
+                tensor.to(device=base.device, dtype=base.dtype),
+                size=(height, tile_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+            canvas[:, :, :, x_start:x_end] = resized[:, :, :, : x_end - x_start]
+            x_start = x_end
+
+        return canvas
     
     def pause_streaming(self) -> None:
         """Pause streaming (frame processing continues only on process_frame requests)"""
@@ -676,28 +716,36 @@ class TouchDesignerManager:
             if control_frame.dtype == np.uint8:
                 control_frame = control_frame.astype(np.float32) / 255.0
             
-            # Update ControlNet image in wrapper (index 0 for first ControlNet)
-            self.wrapper.update_control_image(0, control_frame)
+            controlnet_module = None
+            if (hasattr(self.wrapper, 'stream') and
+                hasattr(self.wrapper.stream, '_controlnet_module')):
+                controlnet_module = self.wrapper.stream._controlnet_module
+
+            controlnet_count = 0
+            if controlnet_module is not None and hasattr(controlnet_module, 'controlnets'):
+                controlnet_count = len(controlnet_module.controlnets)
+
+            if controlnet_module is not None and controlnet_count > 1:
+                # TouchDesigner currently provides a single shared ControlNet input.
+                # Feed that frame through every configured ControlNet preprocessor so
+                # canny/tile/depth all receive the live input instead of only index 0.
+                controlnet_module.update_control_image_efficient(control_frame, index=None)
+            elif controlnet_count > 0:
+                self.wrapper.update_control_image(0, control_frame)
             
             # IMPORTANT: After processing, extract the pre-processed image and send it back to TD
             # The processed image is now available in the controlnet module
             try:
-                if (hasattr(self.wrapper, 'stream') and 
-                    hasattr(self.wrapper.stream, '_controlnet_module') and
-                    self.wrapper.stream._controlnet_module is not None):
-                    
-                    controlnet_module = self.wrapper.stream._controlnet_module
-                    
-                    # Check if we have processed images available
-                    if (hasattr(controlnet_module, 'controlnet_images') and 
-                        len(controlnet_module.controlnet_images) > 0 and
-                        controlnet_module.controlnet_images[0] is not None):
-                        
-                        processed_tensor = controlnet_module.controlnet_images[0]
-                        
-                        # Send the processed ControlNet image back to TouchDesigner
+                if controlnet_module is not None and hasattr(controlnet_module, 'controlnet_images'):
+                    processed_images = [
+                        img for img in controlnet_module.controlnet_images
+                        if img is not None
+                    ]
+                    processed_tensor = self._compose_processed_controlnet_preview(processed_images)
+                    if processed_tensor is not None:
+                        # Send a composite preview when multiple ControlNets are active so
+                        # TouchDesigner does not misleadingly show only the first preprocessor.
                         self._send_processed_controlnet_frame(processed_tensor)
-                        
             except Exception as processed_error:
                 logger.debug(f"Could not extract processed ControlNet image: {processed_error}")
             
@@ -710,7 +758,7 @@ class TouchDesignerManager:
             logger.debug(f"IPAdapter SharedMemory not connected: {self.ipadapter_mem_name}")
             return
         if not self.config.get('use_ipadapter', False):
-            # logger.debug("IPAdapter disabled in config")
+            logger.debug("IPAdapter disabled in config")
             return
             
         if not self.ipadapter_update_requested:
