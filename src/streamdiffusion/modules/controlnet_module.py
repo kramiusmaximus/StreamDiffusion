@@ -234,17 +234,6 @@ class ControlNetModule(OrchestratorUser):
                         )
                     logger.debug("ControlNetModule: cached control images | %s", " | ".join(image_rows))
                     self._last_image_debug_log_time = now
-                result_rows = []
-                for i, img in enumerate(processed_images):
-                    model_id = (
-                        getattr(self.controlnets[i], 'model_id', f'controlnet_{i}')
-                        if i < len(self.controlnets) and self.controlnets[i] is not None
-                        else f'controlnet_{i}'
-                    )
-                    result_rows.append(
-                        f"{model_id}: result={'None' if img is None else tuple(img.shape)}"
-                    )
-                logger.debug("ControlNetModule: preprocess update results | %s", " | ".join(result_rows))
 
     def update_controlnet_scale(self, index: int, scale: float) -> None:
         with self._collections_lock:
