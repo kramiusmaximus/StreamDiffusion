@@ -47,6 +47,8 @@ class TensorRTEngine:
         self.context = None
         self.tensors = OrderedDict()
         self._cuda_stream = None  # Cache CUDA stream
+        self.input_names = []
+        self.output_names = []
 
     def load(self):
         """Load TensorRT engine from file"""
@@ -67,7 +69,10 @@ class TensorRTEngine:
             dtype = trt.nptype(self.engine.get_tensor_dtype(name))
             
             if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                self.input_names.append(name)
                 self.context.set_input_shape(name, shape)
+            else:
+                self.output_names.append(name)
             
             tensor = torch.empty(
                 tuple(shape), dtype=numpy_to_torch_dtype_dict[dtype]
@@ -94,6 +99,18 @@ class TensorRTEngine:
             raise ValueError("ERROR: TensorRT inference failed.")
         
         return self.tensors
+
+    @property
+    def primary_input_name(self):
+        if not self.input_names:
+            raise ValueError("TensorRT engine does not expose any input tensors")
+        return self.input_names[0]
+
+    @property
+    def primary_output_name(self):
+        if not self.output_names:
+            raise ValueError("TensorRT engine does not expose any output tensors")
+        return self.output_names[0]
 
 
 class DepthAnythingTensorrtPreprocessor(BasePreprocessor):
@@ -154,6 +171,11 @@ class DepthAnythingTensorrtPreprocessor(BasePreprocessor):
             
             if not os.path.exists(engine_path):
                 raise FileNotFoundError(f"TensorRT engine not found: {engine_path}")
+            if os.path.isdir(engine_path):
+                raise ValueError(
+                    "depth_tensorrt engine_path must point to a specific .engine file, "
+                    f"not a directory: {engine_path}"
+                )
             
             print(f"Loading TensorRT depth estimation engine: {engine_path}")
             
@@ -184,8 +206,8 @@ class DepthAnythingTensorrtPreprocessor(BasePreprocessor):
             image_resized = image_resized.cuda()
         
         cuda_stream = torch.cuda.current_stream().cuda_stream
-        result = self.engine.infer({"input": image_resized}, cuda_stream)
-        depth = result['output']
+        result = self.engine.infer({self.engine.primary_input_name: image_resized}, cuda_stream)
+        depth = result[self.engine.primary_output_name]
         
         depth = np.reshape(depth.cpu().numpy(), (detect_resolution, detect_resolution))
         depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
@@ -216,8 +238,8 @@ class DepthAnythingTensorrtPreprocessor(BasePreprocessor):
         )
         
         cuda_stream = torch.cuda.current_stream().cuda_stream
-        result = self.engine.infer({"input": image_resized}, cuda_stream)
-        depth_tensor = result['output']
+        result = self.engine.infer({self.engine.primary_input_name: image_resized}, cuda_stream)
+        depth_tensor = result[self.engine.primary_output_name]
         
         depth_tensor = depth_tensor.squeeze() if depth_tensor.dim() > 2 else depth_tensor
         depth_min, depth_max = depth_tensor.min(), depth_tensor.max()

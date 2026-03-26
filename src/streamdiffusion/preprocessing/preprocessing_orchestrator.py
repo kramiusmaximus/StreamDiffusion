@@ -747,32 +747,31 @@ class PreprocessingOrchestrator(BaseOrchestrator[ControlImage, List[Optional[tor
             thread_safe: If True, use thread-safe key naming for background processing
             
         Returns:
-            Dictionary with 'tensor' and 'image'/'image_safe' keys
+            Dictionary with consistent 'tensor', 'image', and 'image_safe' keys.
+            The background-thread path historically requested 'image_safe', while
+            downstream processing still read 'image'. Returning both keeps the
+            payload shape stable across sync and pipelined execution.
         """
-        image_key = 'image_safe' if thread_safe else 'image'
-        
+        image_variant = None
+
         if isinstance(control_image, torch.Tensor):
-            return {
-                'tensor': control_image,
-                image_key: None  # Will create if needed
-            }
+            tensor_variant = control_image
         elif isinstance(control_image, Image.Image):
-            image_copy = control_image.copy()
-            return {
-                image_key: image_copy,
-                'tensor': self._to_tensor_safe(image_copy)
-            }
+            # Copy PIL input before sharing it with worker threads.
+            image_variant = control_image.copy()
+            tensor_variant = self._to_tensor_safe(image_variant)
         elif isinstance(control_image, str):
-            image_loaded = load_image(control_image)
-            return {
-                image_key: image_loaded,
-                'tensor': self._to_tensor_safe(image_loaded)
-            }
+            image_variant = load_image(control_image)
+            tensor_variant = self._to_tensor_safe(image_variant)
         else:
-            return {
-                image_key: control_image,
-                'tensor': None
-            }
+            image_variant = control_image
+            tensor_variant = None
+
+        return {
+            'tensor': tensor_variant,
+            'image': image_variant,
+            'image_safe': image_variant,
+        }
     
     def _group_preprocessors(self,
                            preprocessors: List[Optional[Any]],
