@@ -75,10 +75,13 @@ class ControlNetModule(OrchestratorUser):
         
         # Cache engine type detection to avoid repeated hasattr calls
         self._engine_type_cache: Dict[str, bool] = {}
+        # Default to TensorRT ControlNet runtime when engines are available.
+        # Users can still opt out with STREAMDIFFUSION_ENABLE_TRT_CONTROLNET_RUNTIME=0.
         self._allow_trt_controlnet_runtime = os.getenv(
-            "STREAMDIFFUSION_ENABLE_TRT_CONTROLNET_RUNTIME", ""
+            "STREAMDIFFUSION_ENABLE_TRT_CONTROLNET_RUNTIME", "1"
         ).lower() in ("1", "true", "yes", "on")
         self._logged_trt_runtime_disabled = False
+        self._logged_trt_runtime_enabled = False
         self._last_debug_log_time = 0.0
         self._last_image_debug_log_time = 0.0
 
@@ -494,7 +497,8 @@ class ControlNetModule(OrchestratorUser):
                         if not self._logged_trt_runtime_disabled:
                             logger.info(
                                 "ControlNetModule: using PyTorch ControlNet runtime; "
-                                "set STREAMDIFFUSION_ENABLE_TRT_CONTROLNET_RUNTIME=1 to re-enable TensorRT ControlNet engines."
+                                "set STREAMDIFFUSION_ENABLE_TRT_CONTROLNET_RUNTIME=1 to enable TensorRT ControlNet "
+                                "or =0 to force the PyTorch fallback."
                             )
                             self._logged_trt_runtime_disabled = True
                     elif has_trt_controlnets:
@@ -502,6 +506,12 @@ class ControlNetModule(OrchestratorUser):
                             mid = getattr(eng, 'model_id', None)
                             if mid:
                                 self._engines_by_id[mid] = eng
+                        if not self._logged_trt_runtime_enabled:
+                            logger.info(
+                                "ControlNetModule: using TensorRT ControlNet runtime for %d engine(s).",
+                                len(self._engines_by_id),
+                            )
+                            self._logged_trt_runtime_enabled = True
 
                     self._engines_cache_valid = True
                 except Exception:
