@@ -38,6 +38,10 @@ class EngineBuilder:
         opt_batch_size: int = 1,
         min_image_resolution: int = 256,
         max_image_resolution: int = 1024,
+        min_image_height=None,
+        max_image_height=None,
+        min_image_width=None,
+        max_image_width=None,
         build_enable_refit: bool = False,
         build_static_batch: bool = False,
         build_dynamic_shape: bool = True,
@@ -73,8 +77,25 @@ class EngineBuilder:
                 onnx_opt_path=onnx_opt_path,
                 model_data=self.model,
             )
-        self.model.min_latent_shape = min_image_resolution // 8
-        self.model.max_latent_shape = max_image_resolution // 8
+        min_image_height = min_image_resolution if min_image_height is None else min_image_height
+        max_image_height = max_image_resolution if max_image_height is None else max_image_height
+        min_image_width = min_image_resolution if min_image_width is None else min_image_width
+        max_image_width = max_image_resolution if max_image_width is None else max_image_width
+
+        self.model.min_image_height = min_image_height
+        self.model.max_image_height = max_image_height
+        self.model.min_image_width = min_image_width
+        self.model.max_image_width = max_image_width
+        self.model.min_latent_height = min_image_height // 8
+        self.model.max_latent_height = max_image_height // 8
+        self.model.min_latent_width = min_image_width // 8
+        self.model.max_latent_width = max_image_width // 8
+
+        # Preserve legacy scalar attributes for callers that still expect them.
+        self.model.min_image_shape = min(min_image_height, min_image_width)
+        self.model.max_image_shape = max(max_image_height, max_image_width)
+        self.model.min_latent_shape = min(self.model.min_latent_height, self.model.min_latent_width)
+        self.model.max_latent_shape = max(self.model.max_latent_height, self.model.max_latent_width)
         if not force_engine_build and os.path.exists(engine_path):
             print(f"Found cached engine: {engine_path}")
         else:

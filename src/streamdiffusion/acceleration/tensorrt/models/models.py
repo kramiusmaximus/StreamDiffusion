@@ -85,10 +85,19 @@ class BaseModel:
 
         self.min_batch = min_batch_size
         self.max_batch = max_batch_size
-        self.min_image_shape = 256  # min image resolution: 256x256
-        self.max_image_shape = 1024  # max image resolution: 1024x1024
-        self.min_latent_shape = self.min_image_shape // 8
-        self.max_latent_shape = self.max_image_shape // 8
+        self.min_image_height = 256
+        self.max_image_height = 1024
+        self.min_image_width = 256
+        self.max_image_width = 1024
+        self.min_latent_height = self.min_image_height // 8
+        self.max_latent_height = self.max_image_height // 8
+        self.min_latent_width = self.min_image_width // 8
+        self.max_latent_width = self.max_image_width // 8
+        # Legacy scalar aliases retained for older callers.
+        self.min_image_shape = self.min_image_height
+        self.max_image_shape = self.max_image_height
+        self.min_latent_shape = self.min_latent_height
+        self.max_latent_shape = self.max_latent_height
 
         self.embedding_dim = embedding_dim
         self.text_maxlen = text_maxlen
@@ -142,17 +151,13 @@ class BaseModel:
         assert image_height % 8 == 0 or image_width % 8 == 0
         latent_height = image_height // 8
         latent_width = image_width // 8
-        assert latent_height >= self.min_latent_shape and latent_height <= self.max_latent_shape
-        assert latent_width >= self.min_latent_shape and latent_width <= self.max_latent_shape
+        assert latent_height >= self.min_latent_height and latent_height <= self.max_latent_height
+        assert latent_width >= self.min_latent_width and latent_width <= self.max_latent_width
         return (latent_height, latent_width)
 
     def get_minmax_dims(self, batch_size, image_height, image_width, static_batch, static_shape):
-        # Following ComfyUI TensorRT approach: ensure proper min ≤ opt ≤ max constraints
-        # Even with static_batch=True, we need different min/max to avoid TensorRT constraint violations
-        
         if static_batch:
-            # For static batch, still provide range to avoid min=opt=max constraint violation
-            min_batch = max(1, batch_size - 1)  # At least 1, but allow some range
+            min_batch = batch_size
             max_batch = batch_size
         else:
             min_batch = self.min_batch
@@ -160,17 +165,25 @@ class BaseModel:
         
         latent_height = image_height // 8
         latent_width = image_width // 8
-        
-        # Force dynamic shapes for height/width to enable runtime resolution changes
-        # Always use 384-1024 range regardless of static_shape flag
-        min_image_height = self.min_image_shape
-        max_image_height = self.max_image_shape
-        min_image_width = self.min_image_shape
-        max_image_width = self.max_image_shape
-        min_latent_height = self.min_latent_shape
-        max_latent_height = self.max_latent_shape
-        min_latent_width = self.min_latent_shape
-        max_latent_width = self.max_latent_shape
+
+        if static_shape:
+            min_image_height = image_height
+            max_image_height = image_height
+            min_image_width = image_width
+            max_image_width = image_width
+            min_latent_height = latent_height
+            max_latent_height = latent_height
+            min_latent_width = latent_width
+            max_latent_width = latent_width
+        else:
+            min_image_height = self.min_image_height
+            max_image_height = self.max_image_height
+            min_image_width = self.min_image_width
+            max_image_width = self.max_image_width
+            min_latent_height = self.min_latent_height
+            max_latent_height = self.max_latent_height
+            min_latent_width = self.min_latent_width
+            max_latent_width = self.max_latent_width
         
         return (
             min_batch,
@@ -577,8 +590,8 @@ class UNet(BaseModel):
             opt_latent_width = min(min_latent_width + 8, max_latent_width)
         
         # Image dimensions for ControlNet inputs
-        min_image_h, max_image_h = self.min_image_shape, self.max_image_shape
-        min_image_w, max_image_w = self.min_image_shape, self.max_image_shape
+        min_image_h, max_image_h = self.min_image_height, self.max_image_height
+        min_image_w, max_image_w = self.min_image_width, self.max_image_width
         opt_image_height = min(max(image_height, min_image_h), max_image_h)
         opt_image_width = min(max(image_width, min_image_w), max_image_w)
         
@@ -621,19 +634,27 @@ class UNet(BaseModel):
                 channels = shape_spec["channels"]
                 control_height = shape_spec["height"]
                 control_width = shape_spec["width"]
-                
-                # Create optimization profile with proper spatial dimension scaling
-                # Scale the spatial dimensions proportionally with the main latent dimensions
-                scale_h = opt_latent_height / latent_height if latent_height > 0 else 1.0
-                scale_w = opt_latent_width / latent_width if latent_width > 0 else 1.0
-                
-                min_control_h = max(1, int(control_height * min_latent_height / latent_height))
-                max_control_h = max(min_control_h + 1, int(control_height * max_latent_height / latent_height))
-                opt_control_h = max(min_control_h, min(int(control_height * scale_h), max_control_h))
-                
-                min_control_w = max(1, int(control_width * min_latent_width / latent_width))
-                max_control_w = max(min_control_w + 1, int(control_width * max_latent_width / latent_width))
-                opt_control_w = max(min_control_w, min(int(control_width * scale_w), max_control_w))
+
+                if static_shape:
+                    min_control_h = control_height
+                    max_control_h = control_height
+                    opt_control_h = control_height
+                    min_control_w = control_width
+                    max_control_w = control_width
+                    opt_control_w = control_width
+                else:
+                    # Create optimization profile with proper spatial dimension scaling
+                    # Scale the spatial dimensions proportionally with the main latent dimensions
+                    scale_h = opt_latent_height / latent_height if latent_height > 0 else 1.0
+                    scale_w = opt_latent_width / latent_width if latent_width > 0 else 1.0
+                    
+                    min_control_h = max(1, int(control_height * min_latent_height / latent_height))
+                    max_control_h = max(min_control_h + 1, int(control_height * max_latent_height / latent_height))
+                    opt_control_h = max(min_control_h, min(int(control_height * scale_h), max_control_h))
+                    
+                    min_control_w = max(1, int(control_width * min_latent_width / latent_width))
+                    max_control_w = max(min_control_w + 1, int(control_width * max_latent_width / latent_width))
+                    opt_control_w = max(min_control_w, min(int(control_width * scale_w), max_control_w))
                 
                 profile[name] = [
                     (min_batch, channels, min_control_h, min_control_w),    # min

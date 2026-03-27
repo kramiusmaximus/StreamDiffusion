@@ -96,6 +96,7 @@ class StreamDiffusionWrapper:
         use_safety_checker: bool = False,
         skip_diffusion: bool = False,
         engine_dir: Optional[Union[str, Path]] = "engines",
+        trt_engine_profile: Literal["general", "specialized", "precise"] = "general",
         compile_engines_only: bool = False,
         build_engines_if_missing: bool = True,
         normalize_prompt_weights: bool = True,
@@ -196,6 +197,10 @@ class StreamDiffusionWrapper:
             Whether to skip diffusion and apply only preprocessing/postprocessing hooks, by default False.
         engine_dir : Optional[Union[str, Path]], optional
             Directory path for storing/loading TensorRT engines, by default "engines".
+        trt_engine_profile : Literal["general", "specialized", "precise"], optional
+            TensorRT engine profile selection. "general" reuses broader dynamic engines,
+            while "specialized"/"precise" builds exact-resolution, fixed-batch engines
+            for the current setup.
         build_engines_if_missing : bool, optional
             Whether to build TensorRT engines if they don't exist, by default True.
         normalize_prompt_weights : bool, optional
@@ -278,6 +283,7 @@ class StreamDiffusionWrapper:
         self.dtype = dtype
         self.width = width
         self.height = height
+        self.trt_engine_profile = self._normalize_trt_engine_profile(trt_engine_profile)
         self.mode = mode
         self.output_type = output_type
         self.frame_buffer_size = frame_buffer_size
@@ -307,6 +313,7 @@ class StreamDiffusionWrapper:
             use_tiny_vae=use_tiny_vae,
             cfg_type=cfg_type,
             engine_dir=engine_dir,
+            trt_engine_profile=self.trt_engine_profile,
             build_engines_if_missing=build_engines_if_missing,
             normalize_prompt_weights=normalize_prompt_weights,
             normalize_seed_weights=normalize_seed_weights,
@@ -365,6 +372,57 @@ class StreamDiffusionWrapper:
             self.stream.enable_similar_image_filter(
                 similar_image_filter_threshold, similar_image_filter_max_skip_frame
             )
+
+    @staticmethod
+    def _normalize_trt_engine_profile(
+        trt_engine_profile: Optional[str],
+    ) -> Literal["general", "specialized"]:
+        """Normalize TRT engine profile naming and accept legacy aliases."""
+        if trt_engine_profile is None:
+            return "general"
+        normalized = str(trt_engine_profile).strip().lower()
+        if normalized == "precise":
+            normalized = "specialized"
+        if normalized not in {"general", "specialized"}:
+            raise ValueError(
+                f"Unsupported trt_engine_profile '{trt_engine_profile}'. "
+                "Expected 'general' or 'specialized'."
+            )
+        return normalized
+
+    def _get_trt_engine_build_options(self, engine_kind: Literal["unet", "vae", "controlnet"]) -> Dict[str, Any]:
+        """Build TensorRT profile options for the selected engine specialization mode."""
+        if self.trt_engine_profile == "general":
+            if engine_kind == "unet":
+                return {
+                    'opt_image_height': self.height,
+                    'opt_image_width': self.width,
+                }
+            return {
+                'opt_image_height': self.height,
+                'opt_image_width': self.width,
+                'build_dynamic_shape': True,
+                'build_static_batch': False,
+                'min_image_resolution': 384,
+                'max_image_resolution': 1024,
+                'min_image_height': 384,
+                'max_image_height': 1024,
+                'min_image_width': 384,
+                'max_image_width': 1024,
+            }
+
+        return {
+            'opt_image_height': self.height,
+            'opt_image_width': self.width,
+            'build_dynamic_shape': False,
+            'build_static_batch': True,
+            'min_image_resolution': min(self.height, self.width),
+            'max_image_resolution': max(self.height, self.width),
+            'min_image_height': self.height,
+            'max_image_height': self.height,
+            'min_image_width': self.width,
+            'max_image_width': self.width,
+        }
 
     def prepare(
         self,
@@ -980,6 +1038,7 @@ class StreamDiffusionWrapper:
         use_tiny_vae: bool = True,
         cfg_type: Literal["none", "full", "self", "initialize"] = "self",
         engine_dir: Optional[Union[str, Path]] = "engines",
+        trt_engine_profile: Literal["general", "specialized", "precise"] = "general",
         build_engines_if_missing: bool = True,
         normalize_prompt_weights: bool = True,
         normalize_seed_weights: bool = True,
@@ -1050,6 +1109,9 @@ class StreamDiffusionWrapper:
             You cannot use anything other than "none" for txt2img mode.
         engine_dir : Optional[Union[str, Path]], optional
             Directory path for storing/loading TensorRT engines, by default "engines".
+        trt_engine_profile : Literal["general", "specialized", "precise"], optional
+            TensorRT engine profile selection. "general" uses broader reusable engines,
+            while "specialized"/"precise" builds exact-resolution, fixed-batch engines.
         build_engines_if_missing : bool, optional
             Whether to build TensorRT engines if they don't exist, by default True.
         normalize_prompt_weights : bool, optional
@@ -1096,6 +1158,8 @@ class StreamDiffusionWrapper:
             self.cleanup_gpu_memory()
         except Exception as e:
             logger.warning(f"GPU cleanup warning: {e}")
+
+        trt_engine_profile = self._normalize_trt_engine_profile(trt_engine_profile)
         
         # Reset CUDA context to prevent corruption from previous runs
         torch.cuda.empty_cache()
@@ -1337,6 +1401,12 @@ class StreamDiffusionWrapper:
                 # Legacy TensorRT implementation (fallback)
                 # Initialize engine manager
                 engine_manager = EngineManager(engine_dir)
+                logger.info(f"TensorRT engine profile: {trt_engine_profile}")
+                if trt_engine_profile == "specialized":
+                    logger.info(
+                        f"TensorRT engine profile details: exact resolution {self.width}x{self.height} "
+                        f"with fixed active batch sizes"
+                    )
 
                 # Enhanced SDXL and ControlNet TensorRT support
                 use_controlnet_trt = False
@@ -1432,12 +1502,17 @@ class StreamDiffusionWrapper:
                     ipadapter_tokens = cfg0.get('num_image_tokens', 4)
                     # Determine FaceID type from config for engine naming
                     is_faceid = (cfg0['type'] == 'faceid')
+
+                specialized_unet_batch = stream.trt_unet_batch_size if trt_engine_profile == "specialized" else None
+                unet_engine_min_batch = specialized_unet_batch or self.min_batch_size
+                unet_engine_max_batch = specialized_unet_batch or self.max_batch_size
+
                 # Generate engine paths using EngineManager
                 unet_path = engine_manager.get_engine_path(
                     EngineType.UNET,
                     model_id_or_path=model_id_or_path,
-                    max_batch_size=self.max_batch_size,
-                    min_batch_size=self.min_batch_size,
+                    max_batch_size=unet_engine_max_batch,
+                    min_batch_size=unet_engine_min_batch,
                     mode=self.mode,
                     use_tiny_vae=use_tiny_vae,
                     lora_dict=lora_dict,
@@ -1446,6 +1521,9 @@ class StreamDiffusionWrapper:
                     is_faceid=is_faceid if use_ipadapter_trt else None,
                     use_controlnet=use_controlnet_trt,
                     use_cached_attn=use_cached_attn,
+                    trt_engine_profile=trt_engine_profile,
+                    image_height=self.height,
+                    image_width=self.width,
                 )
                 vae_encoder_path = engine_manager.get_engine_path(
                     EngineType.VAE_ENCODER,
@@ -1457,7 +1535,10 @@ class StreamDiffusionWrapper:
                     lora_dict=lora_dict,
                     ipadapter_scale=ipadapter_scale,
                     ipadapter_tokens=ipadapter_tokens,
-                    is_faceid=is_faceid if use_ipadapter_trt else None
+                    is_faceid=is_faceid if use_ipadapter_trt else None,
+                    trt_engine_profile=trt_engine_profile,
+                    image_height=self.height,
+                    image_width=self.width,
                 )
                 vae_decoder_path = engine_manager.get_engine_path(
                     EngineType.VAE_DECODER,
@@ -1469,7 +1550,10 @@ class StreamDiffusionWrapper:
                     lora_dict=lora_dict,
                     ipadapter_scale=ipadapter_scale,
                     ipadapter_tokens=ipadapter_tokens,
-                    is_faceid=is_faceid if use_ipadapter_trt else None
+                    is_faceid=is_faceid if use_ipadapter_trt else None,
+                    trt_engine_profile=trt_engine_profile,
+                    image_height=self.height,
+                    image_width=self.width,
                 )
 
                 # Check if all required engines exist
@@ -1651,13 +1735,7 @@ class StreamDiffusionWrapper:
                     batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
                     cuda_stream=None,
                     stream_vae=stream.vae,
-                    engine_build_options={
-                        'opt_image_height': self.height,
-                        'opt_image_width': self.width,
-                        'build_dynamic_shape': True,
-                        'min_image_resolution': 384,
-                        'max_image_resolution': 1024,
-                    }
+                    engine_build_options=self._get_trt_engine_build_options("vae")
                 )
 
                 # Compile VAE encoder engine using EngineManager
@@ -1676,13 +1754,7 @@ class StreamDiffusionWrapper:
                     model_config=vae_encoder_model,
                     batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
                     cuda_stream=None,
-                    engine_build_options={
-                        'opt_image_height': self.height,
-                        'opt_image_width': self.width,
-                        'build_dynamic_shape': True,
-                        'min_image_resolution': 384,
-                        'max_image_resolution': 1024,
-                    }
+                    engine_build_options=self._get_trt_engine_build_options("vae")
                 )
 
                 cuda_stream = cuda.Stream()
@@ -1705,10 +1777,7 @@ class StreamDiffusionWrapper:
                         use_ipadapter_trt=use_ipadapter_trt,
                         unet_arch=unet_arch,
                         num_ip_layers=num_ip_layers if use_ipadapter_trt else None,
-                        engine_build_options={
-                            'opt_image_height': self.height,
-                            'opt_image_width': self.width,
-                        }
+                        engine_build_options=self._get_trt_engine_build_options("unet")
                     )
                     if load_engine:
                         logger.info("TensorRT UNet engine loaded successfully")
@@ -1891,14 +1960,17 @@ class StreamDiffusionWrapper:
                                 pytorch_model=cn_model,
                                 model_type=model_type,
                                 batch_size=stream.trt_unet_batch_size,
-                                max_batch_size=self.max_batch_size,
-                                min_batch_size=self.min_batch_size,
+                                max_batch_size=stream.trt_unet_batch_size if trt_engine_profile == "specialized" else self.max_batch_size,
+                                min_batch_size=stream.trt_unet_batch_size if trt_engine_profile == "specialized" else self.min_batch_size,
                                 cuda_stream=cuda_stream,
-                                use_cuda_graph=False,
+                                use_cuda_graph=True,
                                 unet=None,
                                 model_path=cfg['model_id'],
                                 load_engine=load_engine,
-                                conditioning_channels=cfg.get('conditioning_channels', 3)
+                                conditioning_channels=cfg.get('conditioning_channels', 3),
+                                trt_engine_profile=trt_engine_profile,
+                                image_height=self.height,
+                                image_width=self.width,
                             )
                             try:
                                 setattr(engine, 'model_id', cfg['model_id'])

@@ -58,28 +58,39 @@ class ControlNetTRT(BaseModel):
     
     def get_input_profile(self, batch_size, image_height, image_width, 
                          static_batch, static_shape):
-        """Generate TensorRT input profiles for ControlNet with dynamic 384-1024 range"""
+        """Generate TensorRT input profiles for ControlNet."""
         min_batch = batch_size if static_batch else self.min_batch
         max_batch = batch_size if static_batch else self.max_batch
-        
-        # Force dynamic shapes for universal engines (384-1024 range)
-        min_ctrl_h = 384  # Changed from 256 to 512 to match min resolution
-        max_ctrl_h = 1024
-        min_ctrl_w = 384  # Changed from 256 to 512 to match min resolution
-        max_ctrl_w = 1024
-        
-        # Use a flexible optimal resolution that's in the middle of the range
-        # This allows the engine to handle both smaller and larger resolutions
-        opt_ctrl_h = 704  # Middle of 512-1024 range
-        opt_ctrl_w = 704  # Middle of 512-1024 range
-        
-        # Calculate latent dimensions
-        min_latent_h = min_ctrl_h // 8  # 64
-        max_latent_h = max_ctrl_h // 8  # 128
-        min_latent_w = min_ctrl_w // 8  # 64
-        max_latent_w = max_ctrl_w // 8  # 128
-        opt_latent_h = opt_ctrl_h // 8  # 96
-        opt_latent_w = opt_ctrl_w // 8  # 96
+
+        if static_shape:
+            min_ctrl_h = image_height
+            max_ctrl_h = image_height
+            min_ctrl_w = image_width
+            max_ctrl_w = image_width
+            opt_ctrl_h = image_height
+            opt_ctrl_w = image_width
+            min_latent_h = image_height // 8
+            max_latent_h = image_height // 8
+            min_latent_w = image_width // 8
+            max_latent_w = image_width // 8
+            opt_latent_h = image_height // 8
+            opt_latent_w = image_width // 8
+        else:
+            # Universal dynamic profile for shared engines.
+            min_ctrl_h = 384
+            max_ctrl_h = 1024
+            min_ctrl_w = 384
+            max_ctrl_w = 1024
+            opt_ctrl_h = 704
+            opt_ctrl_w = 704
+
+            # Calculate latent dimensions
+            min_latent_h = min_ctrl_h // 8
+            max_latent_h = max_ctrl_h // 8
+            min_latent_w = min_ctrl_w // 8
+            max_latent_w = max_ctrl_w // 8
+            opt_latent_h = opt_ctrl_h // 8
+            opt_latent_w = opt_ctrl_w // 8
         
         profile = {
             "sample": [

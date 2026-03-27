@@ -78,6 +78,20 @@ class EngineManager:
             }
         }
 
+    def _normalize_trt_engine_profile(self, trt_engine_profile: Optional[str]) -> str:
+        """Normalize TRT engine profile naming and accept legacy aliases."""
+        if trt_engine_profile is None:
+            return "general"
+        normalized = str(trt_engine_profile).strip().lower()
+        if normalized == "precise":
+            normalized = "specialized"
+        if normalized not in {"general", "specialized"}:
+            raise ValueError(
+                f"EngineManager: Unsupported trt_engine_profile '{trt_engine_profile}'. "
+                "Expected 'general' or 'specialized'."
+            )
+        return normalized
+
     def _lora_signature(self, lora_dict: Dict[str, float]) -> str:
         """Create a short, stable signature for a set of LoRAs.
 
@@ -106,7 +120,10 @@ class EngineManager:
                        controlnet_model_id: Optional[str] = None,
                        is_faceid: Optional[bool] = None,
                        use_controlnet: Optional[bool] = None,
-                       use_cached_attn: bool = False
+                       use_cached_attn: bool = False,
+                       trt_engine_profile: str = "general",
+                       image_height: Optional[int] = None,
+                       image_width: Optional[int] = None,
                        ) -> Path:
         """
         Generate engine path using wrapper.py's current logic.
@@ -115,6 +132,7 @@ class EngineManager:
         Special handling for ControlNet engines which use model_id-based directories.
         """
         filename = self._configs[engine_type]['filename']
+        trt_engine_profile = self._normalize_trt_engine_profile(trt_engine_profile)
         
         if engine_type == EngineType.CONTROLNET:
             # ControlNet engines use special model_id-based directory structure
@@ -123,9 +141,22 @@ class EngineManager:
             
             # Convert model_id to directory name format (replace "/" with "_")
             model_dir_name = controlnet_model_id.replace("/", "_")
-            
-            # Use ControlNetEnginePool naming convention: dynamic engines with 384-1024 range
-            prefix = f"controlnet_{model_dir_name}--min_batch-{min_batch_size}--max_batch-{max_batch_size}--dyn-384-1024"
+
+            if trt_engine_profile == "specialized":
+                if image_height is None or image_width is None:
+                    raise ValueError(
+                        "get_engine_path: image_height/image_width required for specialized CONTROLNET engines"
+                    )
+                prefix = (
+                    f"controlnet_{model_dir_name}"
+                    f"--min_batch-{min_batch_size}"
+                    f"--max_batch-{max_batch_size}"
+                    f"--trtprof-specialized"
+                    f"--exact-{image_height}x{image_width}"
+                )
+            else:
+                # ControlNet engines use a shared dynamic range by default.
+                prefix = f"controlnet_{model_dir_name}--min_batch-{min_batch_size}--max_batch-{max_batch_size}--dyn-384-1024"
             return self.engine_dir / "preprocessors" / prefix / filename
         else:
             # Standard engines use the unified prefix format
@@ -151,6 +182,17 @@ class EngineManager:
                 if use_controlnet:
                     prefix += "--cn"
                 prefix += f"--use_cached_attn-{use_cached_attn}"
+
+            if trt_engine_profile == "specialized" and engine_type in {
+                EngineType.UNET,
+                EngineType.VAE_ENCODER,
+                EngineType.VAE_DECODER,
+            }:
+                if image_height is None or image_width is None:
+                    raise ValueError(
+                        "get_engine_path: image_height/image_width required for specialized UNET/VAE engines"
+                    )
+                prefix += f"--trtprof-specialized--exact-{image_height}x{image_width}"
             
             prefix += f"--mode-{mode}"
             
@@ -203,14 +245,43 @@ class EngineManager:
         
         return pytorch_model, controlnet_model
     
-    def _get_default_controlnet_build_options(self) -> Dict:
-        """Get default engine build options for ControlNet engines."""
+    def _get_controlnet_build_options(
+        self,
+        trt_engine_profile: str,
+        image_height: Optional[int],
+        image_width: Optional[int],
+    ) -> Dict:
+        """Get build options for ControlNet engines based on the selected profile."""
+        trt_engine_profile = self._normalize_trt_engine_profile(trt_engine_profile)
+
+        if trt_engine_profile == "specialized":
+            if image_height is None or image_width is None:
+                raise ValueError(
+                    "_get_controlnet_build_options: image_height/image_width required for specialized ControlNet engines"
+                )
+            return {
+                'opt_image_height': image_height,
+                'opt_image_width': image_width,
+                'build_dynamic_shape': False,
+                'build_static_batch': True,
+                'min_image_resolution': min(image_height, image_width),
+                'max_image_resolution': max(image_height, image_width),
+                'min_image_height': image_height,
+                'max_image_height': image_height,
+                'min_image_width': image_width,
+                'max_image_width': image_width,
+            }
+
         return {
-            'opt_image_height': 704,  # Dynamic optimal resolution
+            'opt_image_height': 704,
             'opt_image_width': 704,
             'build_dynamic_shape': True,
             'min_image_resolution': 384,
             'max_image_resolution': 1024,
+            'min_image_height': 384,
+            'max_image_height': 1024,
+            'min_image_width': 384,
+            'max_image_width': 1024,
             'build_static_batch': False,
         }
     
@@ -303,7 +374,10 @@ class EngineManager:
                                     use_cuda_graph: bool = False,
                                     unet = None,
                                     model_path: str = "",
-                                    conditioning_channels: int = 3) -> Any:
+                                    conditioning_channels: int = 3,
+                                    trt_engine_profile: str = "general",
+                                    image_height: Optional[int] = None,
+                                    image_width: Optional[int] = None) -> Any:
         """
         Get or load ControlNet engine, providing unified interface for ControlNet management.
         
@@ -317,7 +391,10 @@ class EngineManager:
             min_batch_size=min_batch_size,
             mode="",  # Not used for ControlNet
             use_tiny_vae=False,  # Not used for ControlNet
-            controlnet_model_id=model_id
+            controlnet_model_id=model_id,
+            trt_engine_profile=trt_engine_profile,
+            image_height=image_height,
+            image_width=image_width,
         )
         
         # Compile and load ControlNet engine
@@ -335,5 +412,9 @@ class EngineManager:
             unet=unet,
             model_path=model_path,
             conditioning_channels=conditioning_channels,
-            engine_build_options=self._get_default_controlnet_build_options()
+            engine_build_options=self._get_controlnet_build_options(
+                trt_engine_profile=trt_engine_profile,
+                image_height=image_height,
+                image_width=image_width,
+            )
         )

@@ -100,6 +100,11 @@ class Engine:
         # Buffer reuse optimization tracking
         self._last_shape_dict = None
         self._last_device = None
+        self._allowed_inputs = None
+        self._tensor_addresses_bound = False
+        self._external_stream = None
+        self._external_stream_ptr = None
+        self._external_stream_device = None
 
     def __del__(self):
         # Check if AttributeError: 'Engine' object has no attribute 'buffers'
@@ -261,6 +266,7 @@ class Engine:
     def load(self):
         logger.info(f"Loading TensorRT engine: {self.engine_path}")
         self.engine = engine_from_bytes(bytes_from_path(self.engine_path))
+        self._allowed_inputs = None
 
     def activate(self, reuse_device_memory=None):
         if reuse_device_memory:
@@ -268,6 +274,56 @@ class Engine:
             self.context.device_memory = reuse_device_memory
         else:
             self.context = self.engine.create_execution_context()
+        self._tensor_addresses_bound = False
+        self._external_stream = None
+        self._external_stream_ptr = None
+        self._external_stream_device = None
+
+    def _get_allowed_inputs(self):
+        if self._allowed_inputs is not None:
+            return self._allowed_inputs
+
+        allowed_inputs = set()
+        for idx in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(idx)
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                allowed_inputs.add(name)
+        self._allowed_inputs = allowed_inputs
+        return allowed_inputs
+
+    def _bind_tensor_addresses(self):
+        for name, tensor in self.tensors.items():
+            self.context.set_tensor_address(name, tensor.data_ptr())
+        self._tensor_addresses_bound = True
+
+    def _enqueue_torch_stream_wait(self, stream, device) -> None:
+        if device is None:
+            return
+
+        device_obj = torch.device(device)
+        if device_obj.type != "cuda":
+            return
+
+        if not hasattr(torch.cuda, "ExternalStream"):
+            return
+
+        device_index = device_obj.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+
+        try:
+            if (
+                self._external_stream is None
+                or self._external_stream_ptr != stream.ptr
+                or self._external_stream_device != device_index
+            ):
+                self._external_stream = torch.cuda.ExternalStream(stream.ptr, device=device_index)
+                self._external_stream_ptr = stream.ptr
+                self._external_stream_device = device_index
+            torch.cuda.current_stream(device_index).wait_stream(self._external_stream)
+        except Exception:
+            # Fall back to a full sync only if stream interop is unavailable.
+            CUASSERT(cudart.cudaStreamSynchronize(stream.ptr))
 
     def allocate_buffers(self, shape_dict=None, device="cuda"):
         # Ensure execution context is available (can be None after failed init or cleanup)
@@ -285,6 +341,7 @@ class Engine:
         
         # Clear existing buffers before reallocating
         self.tensors.clear()
+        self._tensor_addresses_bound = False
         
         # Reset CUDA graph when buffers are reallocated
         # The captured graph becomes invalid with new memory addresses
@@ -313,6 +370,8 @@ class Engine:
                                  dtype=numpy_to_torch_dtype_dict[dtype_np]) \
                           .to(device=device)
             self.tensors[name] = tensor
+
+        self._bind_tensor_addresses()
         
         # Cache allocation parameters for reuse check
         self._last_shape_dict = shape_dict.copy() if shape_dict else None
@@ -371,11 +430,7 @@ class Engine:
     def infer(self, feed_dict, stream, use_cuda_graph=False):
         # Filter inputs to only those the engine actually exposes to avoid binding errors
         try:
-            allowed_inputs = set()
-            for idx in range(self.engine.num_io_tensors):
-                name = self.engine.get_tensor_name(idx)
-                if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
-                    allowed_inputs.add(name)
+            allowed_inputs = self._get_allowed_inputs()
 
             # Drop any extra keys (e.g., text_embeds/time_ids) that the engine was not built to accept
             if allowed_inputs:
@@ -395,13 +450,12 @@ class Engine:
         for name, buf in feed_dict.items():
             self.tensors[name].copy_(buf)
 
-        for name, tensor in self.tensors.items():
-            self.context.set_tensor_address(name, tensor.data_ptr())
+        if not self._tensor_addresses_bound:
+            self._bind_tensor_addresses()
 
         if use_cuda_graph:
             if self.cuda_graph_instance is not None:
                 CUASSERT(cudart.cudaGraphLaunch(self.cuda_graph_instance, stream.ptr))
-                CUASSERT(cudart.cudaStreamSynchronize(stream.ptr))
             else:
                 # do inference before CUDA graph capture
                 noerror = self.context.execute_async_v3(stream.ptr)
@@ -418,6 +472,16 @@ class Engine:
             noerror = self.context.execute_async_v3(stream.ptr)
             if not noerror:
                 raise ValueError("ERROR: inference failed.")
+
+        wait_device = None
+        if feed_dict:
+            try:
+                wait_device = next(iter(feed_dict.values())).device
+            except Exception:
+                wait_device = self._last_device
+        else:
+            wait_device = self._last_device
+        self._enqueue_torch_stream_wait(stream, wait_device)
 
         return self.tensors
 

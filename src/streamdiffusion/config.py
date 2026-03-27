@@ -121,6 +121,7 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'use_safety_checker': config.get('use_safety_checker', False),
         'skip_diffusion': config.get('skip_diffusion', False),
         'engine_dir': config.get('engine_dir', 'engines'),
+        'trt_engine_profile': config.get('trt_engine_profile', 'general'),
         'normalize_prompt_weights': config.get('normalize_prompt_weights', True),
         'normalize_seed_weights': config.get('normalize_seed_weights', True),
         'scheduler': config.get('scheduler', 'lcm'),
@@ -489,4 +490,11 @@ def _validate_config(config: Dict[str, Any]) -> None:
         normalize_seed_weights = config['normalize_seed_weights']
         if not isinstance(normalize_seed_weights, bool):
             raise ValueError("_validate_config: 'normalize_seed_weights' must be a boolean value")
+
+    if 'trt_engine_profile' in config:
+        trt_engine_profile = config['trt_engine_profile']
+        if not isinstance(trt_engine_profile, str):
+            raise ValueError("_validate_config: 'trt_engine_profile' must be a string")
+        if trt_engine_profile.lower() not in ['general', 'specialized', 'precise']:
+            raise ValueError("_validate_config: 'trt_engine_profile' must be one of: general, specialized, precise")
 

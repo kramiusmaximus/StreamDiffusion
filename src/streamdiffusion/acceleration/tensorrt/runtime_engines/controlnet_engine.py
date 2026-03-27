@@ -26,6 +26,8 @@ class ControlNetModelEngine:
         
         self._input_names = None
         self._output_names = None
+        self._conditioning_scale_tensor = None
+        self._conditioning_scale_device = None
         
         # Pre-compute model-specific values to eliminate runtime branching
         if self.model_type in ["sdxl", "sdxl_turbo"]:
@@ -47,6 +49,14 @@ class ControlNetModelEngine:
             self.mid_downsample_factor = 8
         
         self._shape_cache = {}
+
+    def _get_conditioning_scale_tensor(self, conditioning_scale: float, device: torch.device) -> torch.Tensor:
+        device_str = str(device)
+        if self._conditioning_scale_tensor is None or self._conditioning_scale_device != device_str:
+            self._conditioning_scale_tensor = torch.empty((), dtype=torch.float32, device=device)
+            self._conditioning_scale_device = device_str
+        self._conditioning_scale_tensor.fill_(float(conditioning_scale))
+        return self._conditioning_scale_tensor
     
     def _resolve_output_shapes(self, batch_size: int, latent_height: int, latent_width: int) -> Dict[str, Tuple[int, ...]]:
         """Optimized shape resolution using pre-computed configurations"""
@@ -89,7 +99,7 @@ class ControlNetModelEngine:
             "timestep": timestep,
             "encoder_hidden_states": encoder_hidden_states,
             "controlnet_cond": controlnet_cond,
-            "conditioning_scale": torch.tensor(conditioning_scale, dtype=torch.float32, device=sample.device)
+            "conditioning_scale": self._get_conditioning_scale_tensor(conditioning_scale, sample.device)
         }
         
         if text_embeds is not None:
@@ -115,9 +125,7 @@ class ControlNetModelEngine:
             self.stream,
             use_cuda_graph=self.use_cuda_graph,
         )
-        
-        self.stream.synchronize()
-        
+
         down_blocks, mid_block = self._extract_controlnet_outputs(outputs)
         
         return down_blocks, mid_block
