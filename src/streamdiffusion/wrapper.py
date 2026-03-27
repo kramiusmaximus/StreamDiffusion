@@ -96,7 +96,7 @@ class StreamDiffusionWrapper:
         use_safety_checker: bool = False,
         skip_diffusion: bool = False,
         engine_dir: Optional[Union[str, Path]] = "engines",
-        trt_engine_profile: Literal["general", "specialized", "precise"] = "general",
+        build_specialized_engine: bool = False,
         compile_engines_only: bool = False,
         build_engines_if_missing: bool = True,
         normalize_prompt_weights: bool = True,
@@ -197,10 +197,9 @@ class StreamDiffusionWrapper:
             Whether to skip diffusion and apply only preprocessing/postprocessing hooks, by default False.
         engine_dir : Optional[Union[str, Path]], optional
             Directory path for storing/loading TensorRT engines, by default "engines".
-        trt_engine_profile : Literal["general", "specialized", "precise"], optional
-            TensorRT engine profile selection. "general" reuses broader dynamic engines,
-            while "specialized"/"precise" builds exact-resolution, fixed-batch engines
-            for the current setup.
+        build_specialized_engine : bool, optional
+            Whether to build exact-resolution, fixed-batch TensorRT engines for the
+            current setup instead of the broader reusable dynamic engines.
         build_engines_if_missing : bool, optional
             Whether to build TensorRT engines if they don't exist, by default True.
         normalize_prompt_weights : bool, optional
@@ -283,7 +282,8 @@ class StreamDiffusionWrapper:
         self.dtype = dtype
         self.width = width
         self.height = height
-        self.trt_engine_profile = self._normalize_trt_engine_profile(trt_engine_profile)
+        self.build_specialized_engine = bool(build_specialized_engine)
+        self.trt_engine_profile = self._resolve_trt_engine_profile(self.build_specialized_engine)
         self.mode = mode
         self.output_type = output_type
         self.frame_buffer_size = frame_buffer_size
@@ -313,7 +313,7 @@ class StreamDiffusionWrapper:
             use_tiny_vae=use_tiny_vae,
             cfg_type=cfg_type,
             engine_dir=engine_dir,
-            trt_engine_profile=self.trt_engine_profile,
+            build_specialized_engine=self.build_specialized_engine,
             build_engines_if_missing=build_engines_if_missing,
             normalize_prompt_weights=normalize_prompt_weights,
             normalize_seed_weights=normalize_seed_weights,
@@ -374,21 +374,11 @@ class StreamDiffusionWrapper:
             )
 
     @staticmethod
-    def _normalize_trt_engine_profile(
-        trt_engine_profile: Optional[str],
+    def _resolve_trt_engine_profile(
+        build_specialized_engine: bool,
     ) -> Literal["general", "specialized"]:
-        """Normalize TRT engine profile naming and accept legacy aliases."""
-        if trt_engine_profile is None:
-            return "general"
-        normalized = str(trt_engine_profile).strip().lower()
-        if normalized == "precise":
-            normalized = "specialized"
-        if normalized not in {"general", "specialized"}:
-            raise ValueError(
-                f"Unsupported trt_engine_profile '{trt_engine_profile}'. "
-                "Expected 'general' or 'specialized'."
-            )
-        return normalized
+        """Resolve the internal TensorRT engine profile from the public boolean flag."""
+        return "specialized" if build_specialized_engine else "general"
 
     def _get_trt_engine_build_options(self, engine_kind: Literal["unet", "vae", "controlnet"]) -> Dict[str, Any]:
         """Build TensorRT profile options for the selected engine specialization mode."""
@@ -1038,7 +1028,7 @@ class StreamDiffusionWrapper:
         use_tiny_vae: bool = True,
         cfg_type: Literal["none", "full", "self", "initialize"] = "self",
         engine_dir: Optional[Union[str, Path]] = "engines",
-        trt_engine_profile: Literal["general", "specialized", "precise"] = "general",
+        build_specialized_engine: bool = False,
         build_engines_if_missing: bool = True,
         normalize_prompt_weights: bool = True,
         normalize_seed_weights: bool = True,
@@ -1109,9 +1099,9 @@ class StreamDiffusionWrapper:
             You cannot use anything other than "none" for txt2img mode.
         engine_dir : Optional[Union[str, Path]], optional
             Directory path for storing/loading TensorRT engines, by default "engines".
-        trt_engine_profile : Literal["general", "specialized", "precise"], optional
-            TensorRT engine profile selection. "general" uses broader reusable engines,
-            while "specialized"/"precise" builds exact-resolution, fixed-batch engines.
+        build_specialized_engine : bool, optional
+            Whether to build exact-resolution, fixed-batch TensorRT engines instead
+            of the broader reusable dynamic engines.
         build_engines_if_missing : bool, optional
             Whether to build TensorRT engines if they don't exist, by default True.
         normalize_prompt_weights : bool, optional
@@ -1159,7 +1149,7 @@ class StreamDiffusionWrapper:
         except Exception as e:
             logger.warning(f"GPU cleanup warning: {e}")
 
-        trt_engine_profile = self._normalize_trt_engine_profile(trt_engine_profile)
+        trt_engine_profile = self._resolve_trt_engine_profile(bool(build_specialized_engine))
         
         # Reset CUDA context to prevent corruption from previous runs
         torch.cuda.empty_cache()
@@ -1401,8 +1391,9 @@ class StreamDiffusionWrapper:
                 # Legacy TensorRT implementation (fallback)
                 # Initialize engine manager
                 engine_manager = EngineManager(engine_dir)
+                logger.info(f"TensorRT specialized engine build: {build_specialized_engine}")
                 logger.info(f"TensorRT engine profile: {trt_engine_profile}")
-                if trt_engine_profile == "specialized":
+                if build_specialized_engine:
                     logger.info(
                         f"TensorRT engine profile details: exact resolution {self.width}x{self.height} "
                         f"with fixed active batch sizes"

@@ -94,6 +94,7 @@ def create_wrapper_from_config(config: Dict[str, Any], **overrides) -> Any:
 def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
     """Extract parameters for StreamDiffusionWrapper.__init__() from config"""
     import torch
+    legacy_trt_profile = str(config.get('trt_engine_profile', 'general')).lower()
     param_map = {
         'model_id_or_path': config.get('model_id', 'stabilityai/sd-turbo'),
         't_index_list': config.get('t_index_list', [0, 16, 32, 45]),
@@ -121,7 +122,10 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'use_safety_checker': config.get('use_safety_checker', False),
         'skip_diffusion': config.get('skip_diffusion', False),
         'engine_dir': config.get('engine_dir', 'engines'),
-        'trt_engine_profile': config.get('trt_engine_profile', 'general'),
+        'build_specialized_engine': config.get(
+            'build_specialized_engine',
+            legacy_trt_profile in ['specialized', 'precise'],
+        ),
         'normalize_prompt_weights': config.get('normalize_prompt_weights', True),
         'normalize_seed_weights': config.get('normalize_seed_weights', True),
         'scheduler': config.get('scheduler', 'lcm'),
@@ -490,6 +494,11 @@ def _validate_config(config: Dict[str, Any]) -> None:
         normalize_seed_weights = config['normalize_seed_weights']
         if not isinstance(normalize_seed_weights, bool):
             raise ValueError("_validate_config: 'normalize_seed_weights' must be a boolean value")
+
+    if 'build_specialized_engine' in config:
+        build_specialized_engine = config['build_specialized_engine']
+        if not isinstance(build_specialized_engine, bool):
+            raise ValueError("_validate_config: 'build_specialized_engine' must be a boolean")
 
     if 'trt_engine_profile' in config:
         trt_engine_profile = config['trt_engine_profile']
