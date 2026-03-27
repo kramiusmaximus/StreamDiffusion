@@ -75,6 +75,7 @@ class ControlNetModule(OrchestratorUser):
         
         # Cache engine type detection to avoid repeated hasattr calls
         self._engine_type_cache: Dict[str, bool] = {}
+        self._use_fused_controlnet_runtime = False
         # Default to TensorRT ControlNet runtime when engines are available.
         # Users can still opt out with STREAMDIFFUSION_ENABLE_TRT_CONTROLNET_RUNTIME=0.
         self._allow_trt_controlnet_runtime = os.getenv(
@@ -480,7 +481,111 @@ class ControlNetModule(OrchestratorUser):
                         if now - self._last_debug_log_time >= 2.0:
                             logger.debug("ControlNetModule: no active controlnets | %s", " | ".join(inactive_rows))
                             self._last_debug_log_time = now
+                    if self._use_fused_controlnet_runtime:
+                        extra_kwargs: Dict[str, Any] = {}
+                        for idx_i, (cn, img, scale) in enumerate(
+                            zip(self.controlnets, self.controlnet_images, self.controlnet_scales)
+                        ):
+                            enabled = enabled_flags[idx_i] if enabled_flags else True
+                            channels = 3
+                            if cn is not None:
+                                channels = getattr(
+                                    getattr(cn, "config", None),
+                                    "conditioning_channels",
+                                    channels,
+                                )
+                            extra_kwargs[f"controlnet_cond_{idx_i:02d}"] = torch.zeros(
+                                x_t.shape[0],
+                                channels,
+                                self._stream.height,
+                                self._stream.width,
+                                device=x_t.device,
+                                dtype=x_t.dtype,
+                            )
+                            extra_kwargs[f"conditioning_scale_{idx_i:02d}"] = torch.tensor(
+                                float(scale) if enabled else 0.0,
+                                device=x_t.device,
+                                dtype=torch.float32,
+                            )
+                        return UnetKwargsDelta(extra_unet_kwargs=extra_kwargs)
                     return UnetKwargsDelta()
+
+            if self._use_fused_controlnet_runtime:
+                if (
+                    self._prepared_device != x_t.device
+                    or self._prepared_dtype != x_t.dtype
+                    or self._prepared_batch != x_t.shape[0]
+                ):
+                    self.prepare_frame_tensors(x_t.device, x_t.dtype, x_t.shape[0])
+
+                prepared_images = self._prepared_tensors
+                extra_kwargs: Dict[str, Any] = {}
+                debug_rows: List[str] = []
+
+                with self._collections_lock:
+                    total_controlnets = len(self.controlnets)
+                    enabled_flags = (
+                        self.enabled_list
+                        if len(self.enabled_list) == total_controlnets
+                        else None
+                    )
+                    for idx_i, (cn, img, scale) in enumerate(
+                        zip(self.controlnets, self.controlnet_images, self.controlnet_scales)
+                    ):
+                        enabled = enabled_flags[idx_i] if enabled_flags else True
+                        current_img = (
+                            prepared_images[idx_i]
+                            if idx_i < len(prepared_images)
+                            else img
+                        )
+                        channels = 3
+                        if cn is not None:
+                            channels = getattr(
+                                getattr(cn, "config", None),
+                                "conditioning_channels",
+                                channels,
+                            )
+
+                        if current_img is None:
+                            current_img = torch.zeros(
+                                x_t.shape[0],
+                                channels,
+                                self._stream.height,
+                                self._stream.width,
+                                device=x_t.device,
+                                dtype=x_t.dtype,
+                            )
+                        elif current_img.shape[0] != x_t.shape[0]:
+                            current_img = self._match_batch_size(current_img, x_t.shape[0])
+
+                        extra_kwargs[f"controlnet_cond_{idx_i:02d}"] = current_img
+                        extra_kwargs[f"conditioning_scale_{idx_i:02d}"] = torch.tensor(
+                            float(scale) if enabled else 0.0,
+                            device=x_t.device,
+                            dtype=torch.float32,
+                        )
+
+                        if logger.isEnabledFor(logging.DEBUG):
+                            model_id = (
+                                getattr(cn, "model_id", f"controlnet_{idx_i}")
+                                if cn is not None
+                                else f"controlnet_{idx_i}"
+                            )
+                            debug_rows.append(
+                                f"{model_id}: enabled={bool(enabled)} scale={float(scale):.3f} "
+                                f"img={tuple(current_img.shape)}"
+                            )
+
+                if debug_rows:
+                    now = time.time()
+                    if now - self._last_debug_log_time >= 2.0:
+                        logger.debug(
+                            "ControlNetModule: fused control inputs | %s",
+                            " | ".join(debug_rows),
+                        )
+                        self._last_debug_log_time = now
+
+                return UnetKwargsDelta(extra_unet_kwargs=extra_kwargs)
 
             # Cache TRT engines lookup to avoid rebuilding every frame.
             # Default to the PyTorch ControlNet path unless explicitly enabled.

@@ -131,6 +131,7 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'scheduler': config.get('scheduler', 'lcm'),
         'sampler': config.get('sampler', 'normal'),
         'compile_engines_only': config.get('compile_engines_only', False),
+        'fuse_networks': config.get('fuse_networks', False),
     }
     if 'controlnets' in config and config['controlnets']:
         param_map['use_controlnet'] = True

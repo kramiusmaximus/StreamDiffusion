@@ -107,6 +107,20 @@ class EngineManager:
         h = hashlib.sha1(canon.encode("utf-8")).hexdigest()[:10]
         return f"{len(lora_dict)}-{h}"
 
+    def _controlnet_signature(self, model_ids: list[str]) -> str:
+        """Create a short, stable signature for a fixed fused ControlNet stack."""
+        canonical = "|".join(sorted(str(model_id) for model_id in model_ids))
+        digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:10]
+        return f"{len(model_ids)}-{digest}"
+
+    def _fused_controlnet_signature(self, model_ids: list[str]) -> str:
+        """Versioned signature for fused ControlNet+UNet engines.
+
+        Bump the prefix version whenever the fused export/runtime input contract changes so
+        stale ONNX/engine caches do not get silently reused.
+        """
+        return f"v2-{self._controlnet_signature(model_ids)}"
+
     def get_engine_path(self, 
                        engine_type: EngineType,
                        model_id_or_path: str,
@@ -120,6 +134,8 @@ class EngineManager:
                        controlnet_model_id: Optional[str] = None,
                        is_faceid: Optional[bool] = None,
                        use_controlnet: Optional[bool] = None,
+                       use_fused_controlnet: bool = False,
+                       fused_controlnet_model_ids: Optional[list[str]] = None,
                        use_cached_attn: bool = False,
                        trt_engine_profile: str = "general",
                        image_height: Optional[int] = None,
@@ -181,6 +197,8 @@ class EngineManager:
             if engine_type == EngineType.UNET:
                 if use_controlnet:
                     prefix += "--cn"
+                if use_fused_controlnet and fused_controlnet_model_ids:
+                    prefix += f"--fusedcn-{self._fused_controlnet_signature(fused_controlnet_model_ids)}"
                 prefix += f"--use_cached_attn-{use_cached_attn}"
 
             if trt_engine_profile == "specialized" and engine_type in {
@@ -351,9 +369,27 @@ class EngineManager:
         """Set metadata on UNet engine for runtime use."""
         setattr(loaded_engine, 'use_control', kwargs.get('use_controlnet_trt', False))
         setattr(loaded_engine, 'use_ipadapter', kwargs.get('use_ipadapter_trt', False))
+        setattr(loaded_engine, 'use_fused_controlnet', kwargs.get('use_fused_controlnet_trt', False))
         
         if kwargs.get('use_controlnet_trt', False):
             setattr(loaded_engine, 'unet_arch', kwargs.get('unet_arch', {}))
+
+        if kwargs.get('use_fused_controlnet_trt', False):
+            setattr(
+                loaded_engine,
+                'fused_controlnet_conditioning_channels',
+                kwargs.get('fused_controlnet_conditioning_channels', []),
+            )
+            setattr(
+                loaded_engine,
+                'fused_controlnet_count',
+                kwargs.get('fused_controlnet_count', 0),
+            )
+            setattr(
+                loaded_engine,
+                'use_sdxl_added_cond',
+                kwargs.get('use_sdxl_added_cond', False),
+            )
             
         if kwargs.get('use_ipadapter_trt', False):
             setattr(loaded_engine, 'ipadapter_arch', kwargs.get('unet_arch', {}))

@@ -19,6 +19,7 @@
 
 import onnx_graphsurgeon as gs
 import torch
+from typing import List, Optional
 from onnx import shape_inference
 from polygraphy.backend.onnx.loader import fold_constants
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
@@ -347,6 +348,9 @@ class UNet(BaseModel):
         text_maxlen=77,
         unet_dim=4,
         use_control=False,
+        use_fused_controlnet: bool = False,
+        fused_controlnet_conditioning_channels: Optional[List[int]] = None,
+        use_sdxl_added_cond: bool = False,
         unet_arch=None,
         image_height=512,
         image_width=512,
@@ -372,8 +376,12 @@ class UNet(BaseModel):
         self.image_height = image_height
         self.image_width = image_width
         
-        self.use_control = use_control
+        self.use_fused_controlnet = use_fused_controlnet
+        self.use_control = use_control and not use_fused_controlnet
         self.unet_arch = unet_arch or {}
+        self.fused_controlnet_conditioning_channels = list(fused_controlnet_conditioning_channels or [])
+        self.num_fused_controlnets = len(self.fused_controlnet_conditioning_channels)
+        self.use_sdxl_added_cond = use_sdxl_added_cond
         self.use_ipadapter = use_ipadapter
         self.num_image_tokens = num_image_tokens
         self.num_ip_layers = num_ip_layers
@@ -510,6 +518,13 @@ class UNet(BaseModel):
                 logging.getLogger(__name__).debug(f"TRT Models: get_input_names with ipadapter -> {base_names}")
             except Exception:
                 pass
+        if self.use_fused_controlnet:
+            for idx in range(self.num_fused_controlnets):
+                base_names.append(f"controlnet_cond_{idx:02d}")
+                base_names.append(f"conditioning_scale_{idx:02d}")
+            if self.use_sdxl_added_cond:
+                base_names.append("text_embeds")
+                base_names.append("time_ids")
         if self.use_control and self.control_inputs:
             control_names = sorted(self.control_inputs.keys())
             base_names = base_names + control_names
@@ -544,6 +559,12 @@ class UNet(BaseModel):
                 logging.getLogger(__name__).debug(f"TRT Models: dynamic axes include ipadapter_scale with L_ip={getattr(self, 'num_ip_layers', None)}")
             except Exception:
                 pass
+        if self.use_fused_controlnet:
+            for idx in range(self.num_fused_controlnets):
+                base_axes[f"controlnet_cond_{idx:02d}"] = {0: "2B", 2: "H_img", 3: "W_img"}
+            if self.use_sdxl_added_cond:
+                base_axes["text_embeds"] = {0: "2B"}
+                base_axes["time_ids"] = {0: "2B"}
         
         if self.use_control and self.control_inputs:
             for name, shape_spec in self.control_inputs.items():
@@ -626,6 +647,29 @@ class UNet(BaseModel):
                 logging.getLogger(__name__).debug(f"TRT Models: profile ipadapter_scale min/opt/max={(1,),(self.num_ip_layers,),(self.num_ip_layers,)}")
             except Exception:
                 pass
+        if self.use_fused_controlnet:
+            for idx, channels in enumerate(self.fused_controlnet_conditioning_channels):
+                profile[f"controlnet_cond_{idx:02d}"] = [
+                    (min_batch, channels, min_image_h, min_image_w),
+                    (batch_size, channels, opt_image_height, opt_image_width),
+                    (max_batch, channels, max_image_h, max_image_w),
+                ]
+                profile[f"conditioning_scale_{idx:02d}"] = [
+                    (),
+                    (),
+                    (),
+                ]
+            if self.use_sdxl_added_cond:
+                profile["text_embeds"] = [
+                    (min_batch, 1280),
+                    (batch_size, 1280),
+                    (max_batch, 1280),
+                ]
+                profile["time_ids"] = [
+                    (min_batch, 6),
+                    (batch_size, 6),
+                    (max_batch, 6),
+                ]
         
         if self.use_control and self.control_inputs:
             # Use the actual calculated spatial dimensions for each ControlNet input
@@ -682,6 +726,13 @@ class UNet(BaseModel):
                 logging.getLogger(__name__).debug(f"TRT Models: shape_dict ipadapter_scale={(self.num_ip_layers,)}")
             except Exception:
                 pass
+        if self.use_fused_controlnet:
+            for idx, channels in enumerate(self.fused_controlnet_conditioning_channels):
+                shape_dict[f"controlnet_cond_{idx:02d}"] = (2 * batch_size, channels, image_height, image_width)
+                shape_dict[f"conditioning_scale_{idx:02d}"] = ()
+            if self.use_sdxl_added_cond:
+                shape_dict["text_embeds"] = (2 * batch_size, 1280)
+                shape_dict["time_ids"] = (2 * batch_size, 6)
         
         if self.use_control and self.control_inputs:
             # Use the actual calculated spatial dimensions for each ControlNet input
@@ -725,6 +776,37 @@ class UNet(BaseModel):
         
         if self.use_ipadapter:
             base_inputs.append(torch.ones(self.num_ip_layers, dtype=torch.float32, device=self.device))
+        
+        if self.use_fused_controlnet:
+            for channels in self.fused_controlnet_conditioning_channels:
+                base_inputs.append(
+                    torch.randn(
+                        2 * export_batch_size,
+                        channels,
+                        image_height,
+                        image_width,
+                        dtype=dtype,
+                        device=self.device,
+                    )
+                )
+                base_inputs.append(torch.tensor(1.0, dtype=torch.float32, device=self.device))
+            if self.use_sdxl_added_cond:
+                base_inputs.append(
+                    torch.randn(
+                        2 * export_batch_size,
+                        1280,
+                        dtype=dtype,
+                        device=self.device,
+                    )
+                )
+                base_inputs.append(
+                    torch.randn(
+                        2 * export_batch_size,
+                        6,
+                        dtype=dtype,
+                        device=self.device,
+                    )
+                )
         
         if self.use_control and self.control_inputs:
             control_inputs = []

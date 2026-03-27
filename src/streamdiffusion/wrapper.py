@@ -107,6 +107,7 @@ class StreamDiffusionWrapper:
         # ControlNet options
         use_controlnet: bool = False,
         controlnet_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
+        fuse_networks: bool = False,
         # IPAdapter options
         use_ipadapter: bool = False,
         ipadapter_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
@@ -218,6 +219,10 @@ class StreamDiffusionWrapper:
             ControlNet configuration(s), by default None.
             Can be a single config dict or list of config dicts for multiple ControlNets.
             Each config should contain: model_id, preprocessor (optional), conditioning_scale, etc.
+        fuse_networks : bool, optional
+            Whether to use the fused SDXL Turbo TensorRT path. This fuses ControlNet into
+            the UNet engine and keeps IPAdapter baked into the exported UNet when enabled.
+            Unsupported model families fall back to the standard TensorRT path, by default False.
         use_ipadapter : bool, optional
             Whether to enable IPAdapter support, by default False.
         ipadapter_config : Optional[Union[Dict[str, Any], List[Dict[str, Any]]]], optional
@@ -254,6 +259,7 @@ class StreamDiffusionWrapper:
         self.use_controlnet = use_controlnet
         self.use_ipadapter = use_ipadapter
         self.ipadapter_config = ipadapter_config
+        self.fuse_networks = bool(fuse_networks)
         
         # Store pipeline hook configurations
         self.image_preprocessing_config = image_preprocessing_config
@@ -321,6 +327,7 @@ class StreamDiffusionWrapper:
             sampler=sampler,
             use_controlnet=use_controlnet,
             controlnet_config=controlnet_config,
+            fuse_networks=self.fuse_networks,
             use_ipadapter=use_ipadapter,
             ipadapter_config=ipadapter_config,
             # Pipeline hook configurations
@@ -1036,6 +1043,7 @@ class StreamDiffusionWrapper:
         sampler: Literal["simple", "sgm uniform", "normal", "ddim", "beta", "karras"] = "normal",
         use_controlnet: bool = False,
         controlnet_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
+        fuse_networks: bool = False,
         use_ipadapter: bool = False,
         ipadapter_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
         # Pipeline hook configurations (Phase 4: Configuration Integration)
@@ -1313,6 +1321,18 @@ class StreamDiffusionWrapper:
             cache_maxframes=cache_maxframes,
         )
 
+        normalized_controlnet_configs = (
+            controlnet_config
+            if isinstance(controlnet_config, list)
+            else [controlnet_config]
+            if isinstance(controlnet_config, dict)
+            else []
+        )
+        normalized_controlnet_configs = [
+            cfg for cfg in normalized_controlnet_configs if isinstance(cfg, dict) and cfg.get("model_id")
+        ]
+        setattr(stream, "use_fused_controlnet_trt", False)
+
         
         # Load and properly merge LoRA weights using the standard diffusers approach
         lora_adapters_to_merge = []
@@ -1401,10 +1421,14 @@ class StreamDiffusionWrapper:
 
                 # Enhanced SDXL and ControlNet TensorRT support
                 use_controlnet_trt = False
+                use_fused_controlnet_trt = False
                 use_ipadapter_trt = False
                 unet_arch = {}
                 is_sdxl_model = False
                 load_engine = not compile_engines_only
+                cn_module = getattr(stream, "_controlnet_module", None)
+                fused_controlnet_models: List[torch.nn.Module] = []
+                fused_controlnet_conditioning_channels: List[int] = []
                 
                 # Use the explicit use_ipadapter parameter
                 has_ipadapter = use_ipadapter
@@ -1460,6 +1484,29 @@ class StreamDiffusionWrapper:
                     else:
                         # Neither enabled: Standard UNet
                         unet_arch = {}
+
+                    if (
+                        fuse_networks
+                        and normalized_controlnet_configs
+                        and use_controlnet_trt
+                        and is_sdxl
+                        and is_turbo
+                    ):
+                        use_fused_controlnet_trt = True
+                        use_controlnet_trt = False
+                        if use_ipadapter_trt:
+                            logger.info(
+                                "   Using fused ControlNet+UNet TensorRT path with baked-in IPAdapter"
+                            )
+                        else:
+                            logger.info(
+                                "   Using fused ControlNet+UNet TensorRT path"
+                            )
+                    elif fuse_networks and not (is_sdxl and is_turbo):
+                        logger.info(
+                            "   fuse_networks is supported for SDXL Turbo only; "
+                            "using the standard TensorRT path."
+                        )
                         
                 except Exception as e:
                     logger.error(f"Advanced model detection failed: {e}")
@@ -1470,10 +1517,25 @@ class StreamDiffusionWrapper:
                         detection_result = detect_model(stream.unet, None)
                         model_type = detection_result['model_type']
                         is_sdxl = detection_result['is_sdxl']
+                        is_turbo = detection_result['is_turbo']
                         if self.use_controlnet:
                             unet_arch = extract_unet_architecture(stream.unet)
                             unet_arch = validate_architecture(unet_arch, model_type)
                             use_controlnet_trt = True
+                        if (
+                            fuse_networks
+                            and normalized_controlnet_configs
+                            and use_controlnet_trt
+                            and is_sdxl
+                            and is_turbo
+                        ):
+                            use_fused_controlnet_trt = True
+                            use_controlnet_trt = False
+                        elif fuse_networks and not (is_sdxl and is_turbo):
+                            logger.info(
+                                "   fuse_networks is supported for SDXL Turbo only; "
+                                "using the standard TensorRT path."
+                            )
                     except Exception:
                         pass
                 
@@ -1510,7 +1572,9 @@ class StreamDiffusionWrapper:
                     ipadapter_scale=ipadapter_scale,
                     ipadapter_tokens=ipadapter_tokens,
                     is_faceid=is_faceid if use_ipadapter_trt else None,
-                    use_controlnet=use_controlnet_trt,
+                    use_controlnet=(use_controlnet_trt or use_fused_controlnet_trt),
+                    use_fused_controlnet=use_fused_controlnet_trt,
+                    fused_controlnet_model_ids=[cfg["model_id"] for cfg in normalized_controlnet_configs] if use_fused_controlnet_trt else None,
                     use_cached_attn=use_cached_attn,
                     trt_engine_profile=trt_engine_profile,
                     image_height=self.height,
@@ -1640,6 +1704,48 @@ class StreamDiffusionWrapper:
                 # installing processors in the export wrapper. We construct the wrapper first to discover it,
                 # then construct UNet model with that value.
 
+                if use_fused_controlnet_trt and cn_module is None:
+                    from streamdiffusion.modules.controlnet_module import (
+                        ControlNetConfig,
+                        ControlNetModule,
+                    )
+
+                    cn_module = ControlNetModule(device=self.device, dtype=self.dtype)
+                    cn_module.install(stream)
+                    for cfg in normalized_controlnet_configs:
+                        cn_cfg = ControlNetConfig(
+                            model_id=cfg["model_id"],
+                            preprocessor=cfg.get("preprocessor"),
+                            conditioning_scale=cfg.get("conditioning_scale", 1.0),
+                            enabled=cfg.get("enabled", True),
+                            conditioning_channels=cfg.get("conditioning_channels"),
+                            preprocessor_params=cfg.get("preprocessor_params"),
+                        )
+                        cn_module.add_controlnet(
+                            cn_cfg, control_image=cfg.get("control_image")
+                        )
+                    stream._controlnet_module = cn_module
+
+                if use_fused_controlnet_trt and cn_module is not None:
+                    for cfg, cn_model in zip(
+                        normalized_controlnet_configs, cn_module.controlnets
+                    ):
+                        if cn_model is None:
+                            continue
+                        fused_channels = cfg.get("conditioning_channels")
+                        if fused_channels is None:
+                            fused_channels = getattr(
+                                getattr(cn_model, "config", None),
+                                "conditioning_channels",
+                                3,
+                            )
+                        fused_controlnet_conditioning_channels.append(
+                            int(fused_channels or 3)
+                        )
+                        fused_controlnet_models.append(
+                            cn_model.to(device=self.device, dtype=stream.unet.dtype)
+                        )
+
                 # Build a temporary unified wrapper to install processors and discover num_ip_layers
                 from streamdiffusion.acceleration.tensorrt.export_wrappers.unet_unified_export import UnifiedExportWrapper
                 temp_wrapped_unet = UnifiedExportWrapper(
@@ -1647,7 +1753,9 @@ class StreamDiffusionWrapper:
                     use_controlnet=use_controlnet_trt,
                     use_ipadapter=use_ipadapter_trt,
                     control_input_names=None,
-                    num_tokens=num_tokens
+                    num_tokens=num_tokens,
+                    fused_controlnets=fused_controlnet_models if use_fused_controlnet_trt else None,
+                    fused_controlnet_conditioning_channels=fused_controlnet_conditioning_channels if use_fused_controlnet_trt else None,
                 )
 
                 num_ip_layers = None
@@ -1670,7 +1778,10 @@ class StreamDiffusionWrapper:
                     min_batch_size=self.min_batch_size,
                     embedding_dim=embedding_dim,
                     unet_dim=stream.unet.config.in_channels,
-                    use_control=use_controlnet_trt,
+                    use_control=use_controlnet_trt and not use_fused_controlnet_trt,
+                    use_fused_controlnet=use_fused_controlnet_trt,
+                    fused_controlnet_conditioning_channels=fused_controlnet_conditioning_channels if use_fused_controlnet_trt else None,
+                    use_sdxl_added_cond=is_sdxl if use_fused_controlnet_trt else False,
                     unet_arch=unet_arch if use_controlnet_trt else None,
                     use_ipadapter=use_ipadapter_trt,
                     num_image_tokens=num_tokens,
@@ -1684,7 +1795,7 @@ class StreamDiffusionWrapper:
                 )
 
                 # Use ControlNet wrapper if ControlNet support is enabled
-                if use_controlnet_trt:
+                if use_controlnet_trt and not use_fused_controlnet_trt:
                     # Build control_input_names excluding ipadapter_scale so indices align to 3-base offset
                     all_input_names = unet_model.get_input_names()
                     control_input_names = [name for name in all_input_names if name != 'ipadapter_scale']
@@ -1693,11 +1804,13 @@ class StreamDiffusionWrapper:
                 # Recreate wrapped_unet with control input names if needed (after unet_model is ready)
                 wrapped_unet = UnifiedExportWrapper(
                     stream.unet,
-                    use_controlnet=use_controlnet_trt,
+                    use_controlnet=use_controlnet_trt and not use_fused_controlnet_trt,
                     use_ipadapter=use_ipadapter_trt,
                     control_input_names=control_input_names,
                     num_tokens=num_tokens,
                     kvo_cache_structure=kvo_cache_structure,
+                    fused_controlnets=fused_controlnet_models if use_fused_controlnet_trt else None,
+                    fused_controlnet_conditioning_channels=fused_controlnet_conditioning_channels if use_fused_controlnet_trt else None,
                 )
 
                 if use_cached_attn:
@@ -1765,13 +1878,28 @@ class StreamDiffusionWrapper:
                         batch_size=stream.trt_unet_batch_size,
                         cuda_stream=cuda_stream,
                         use_controlnet_trt=use_controlnet_trt,
+                        use_fused_controlnet_trt=use_fused_controlnet_trt,
                         use_ipadapter_trt=use_ipadapter_trt,
                         unet_arch=unet_arch,
                         num_ip_layers=num_ip_layers if use_ipadapter_trt else None,
+                        fused_controlnet_conditioning_channels=fused_controlnet_conditioning_channels if use_fused_controlnet_trt else [],
+                        fused_controlnet_count=len(fused_controlnet_conditioning_channels) if use_fused_controlnet_trt else 0,
+                        use_sdxl_added_cond=is_sdxl if use_fused_controlnet_trt else False,
                         engine_build_options=self._get_trt_engine_build_options("unet")
                     )
                     if load_engine:
                         logger.info("TensorRT UNet engine loaded successfully")
+                    if use_fused_controlnet_trt and cn_module is not None:
+                        for cn_model in cn_module.controlnets:
+                            if cn_model is None:
+                                continue
+                            try:
+                                cn_model.to(device="cpu", dtype=self.dtype)
+                            except Exception:
+                                pass
+                    setattr(stream, "use_fused_controlnet_trt", use_fused_controlnet_trt)
+                    if use_fused_controlnet_trt and hasattr(stream, "_controlnet_module"):
+                        stream._controlnet_module._use_fused_controlnet_runtime = True
                     
                 except Exception as e:
                     error_msg = str(e).lower()
@@ -1915,71 +2043,78 @@ class StreamDiffusionWrapper:
         if use_controlnet:
             try:
                 from streamdiffusion.modules.controlnet_module import ControlNetModule, ControlNetConfig
-                cn_module = ControlNetModule(device=self.device, dtype=self.dtype)
-                cn_module.install(stream)
-                # Normalize to list of configs
-                configs = (
-                    controlnet_config
-                    if isinstance(controlnet_config, list)
-                    else [controlnet_config]
-                    if isinstance(controlnet_config, dict)
-                    else []
-                )
-                for cfg in configs:
-                    if not cfg.get('model_id'):
-                        continue
-                    cn_cfg = ControlNetConfig(
-                        model_id=cfg['model_id'],
-                        preprocessor=cfg.get('preprocessor'),
-                        conditioning_scale=cfg.get('conditioning_scale', 1.0),
-                        enabled=cfg.get('enabled', True),
-                        conditioning_channels=cfg.get('conditioning_channels'),
-                        preprocessor_params=cfg.get('preprocessor_params'),
-                    )
-                    cn_module.add_controlnet(cn_cfg, control_image=cfg.get('control_image'))
-                # Expose for later updates if needed by caller code
-                stream._controlnet_module = cn_module
+                cn_module = getattr(stream, "_controlnet_module", None)
+                configs = normalized_controlnet_configs
 
-                try:
-                    compiled_cn_engines = []
-                    for cfg, cn_model in zip(configs, cn_module.controlnets):
-                        if not cfg or not cfg.get('model_id') or cn_model is None:
-                            continue
-                        try:
-                            engine = engine_manager.get_or_load_controlnet_engine(
-                                model_id=cfg['model_id'],
-                                pytorch_model=cn_model,
-                                model_type=model_type,
-                                batch_size=stream.trt_unet_batch_size,
-                                max_batch_size=stream.trt_unet_batch_size if trt_engine_profile == "specialized" else self.max_batch_size,
-                                min_batch_size=stream.trt_unet_batch_size if trt_engine_profile == "specialized" else self.min_batch_size,
-                                cuda_stream=cuda_stream,
-                                use_cuda_graph=True,
-                                unet=None,
-                                model_path=cfg['model_id'],
-                                load_engine=load_engine,
-                                conditioning_channels=cfg.get('conditioning_channels', 3),
-                                trt_engine_profile=trt_engine_profile,
-                                image_height=self.height,
-                                image_width=self.width,
-                            )
+                if cn_module is None:
+                    cn_module = ControlNetModule(device=self.device, dtype=self.dtype)
+                    cn_module.install(stream)
+                    for cfg in configs:
+                        cn_cfg = ControlNetConfig(
+                            model_id=cfg['model_id'],
+                            preprocessor=cfg.get('preprocessor'),
+                            conditioning_scale=cfg.get('conditioning_scale', 1.0),
+                            enabled=cfg.get('enabled', True),
+                            conditioning_channels=cfg.get('conditioning_channels'),
+                            preprocessor_params=cfg.get('preprocessor_params'),
+                        )
+                        cn_module.add_controlnet(cn_cfg, control_image=cfg.get('control_image'))
+                    stream._controlnet_module = cn_module
+
+                if getattr(stream, "use_fused_controlnet_trt", False):
+                    cn_module._use_fused_controlnet_runtime = True
+                    if use_ipadapter_trt:
+                        logger.info(
+                            "Using fused ControlNet+UNet TensorRT engine with baked-in "
+                            "IPAdapter processors; skipping separate ControlNet TensorRT "
+                            "engine compilation."
+                        )
+                    else:
+                        logger.info(
+                            "Using fused ControlNet+UNet TensorRT engine; "
+                            "skipping separate ControlNet TensorRT engine compilation."
+                        )
+                elif acceleration == "tensorrt":
+                    try:
+                        compiled_cn_engines = []
+                        for cfg, cn_model in zip(configs, cn_module.controlnets):
+                            if not cfg or not cfg.get('model_id') or cn_model is None:
+                                continue
                             try:
-                                setattr(engine, 'model_id', cfg['model_id'])
+                                engine = engine_manager.get_or_load_controlnet_engine(
+                                    model_id=cfg['model_id'],
+                                    pytorch_model=cn_model,
+                                    model_type=model_type,
+                                    batch_size=stream.trt_unet_batch_size,
+                                    max_batch_size=stream.trt_unet_batch_size if trt_engine_profile == "specialized" else self.max_batch_size,
+                                    min_batch_size=stream.trt_unet_batch_size if trt_engine_profile == "specialized" else self.min_batch_size,
+                                    cuda_stream=cuda_stream,
+                                    use_cuda_graph=True,
+                                    unet=None,
+                                    model_path=cfg['model_id'],
+                                    load_engine=load_engine,
+                                    conditioning_channels=cfg.get('conditioning_channels', 3),
+                                    trt_engine_profile=trt_engine_profile,
+                                    image_height=self.height,
+                                    image_width=self.width,
+                                )
+                                try:
+                                    setattr(engine, 'model_id', cfg['model_id'])
+                                except Exception:
+                                    pass
+                                compiled_cn_engines.append(engine)
+                            except Exception as e:
+                                logger.warning(f"Failed to compile/load ControlNet engine for {cfg.get('model_id')}: {e}")
+                        if compiled_cn_engines:
+                            setattr(stream, 'controlnet_engines', compiled_cn_engines)
+                            try:
+                                logger.info(f"Compiled/loaded {len(compiled_cn_engines)} ControlNet TensorRT engine(s)")
                             except Exception:
                                 pass
-                            compiled_cn_engines.append(engine)
-                        except Exception as e:
-                            logger.warning(f"Failed to compile/load ControlNet engine for {cfg.get('model_id')}: {e}")
-                    if compiled_cn_engines:
-                        setattr(stream, 'controlnet_engines', compiled_cn_engines)
-                        try:
-                            logger.info(f"Compiled/loaded {len(compiled_cn_engines)} ControlNet TensorRT engine(s)")
-                        except Exception:
-                            pass
-                except Exception:
-                    import traceback
-                    traceback.print_exc()
-                    logger.warning("ControlNet TensorRT engine build step encountered an issue; continuing with PyTorch ControlNet")
+                    except Exception:
+                        import traceback
+                        traceback.print_exc()
+                        logger.warning("ControlNet TensorRT engine build step encountered an issue; continuing with PyTorch ControlNet")
             except Exception:
                 import traceback
                 traceback.print_exc()

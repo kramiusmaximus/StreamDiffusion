@@ -39,6 +39,8 @@ class UNet2DConditionModelEngine:
         self._input_control_names = [f"input_control_{i:02d}" for i in range(20)]
         self._output_control_names = [f"output_control_{i:02d}" for i in range(20)]
         self._input_control_middle = "input_control_middle"
+        self._fused_control_cond_names = [f"controlnet_cond_{i:02d}" for i in range(20)]
+        self._fused_control_scale_names = [f"conditioning_scale_{i:02d}" for i in range(20)]
 
     def _check_use_ipadapter(self) -> bool:
         """Cache IP-Adapter detection to avoid repeated getattr calls"""
@@ -99,7 +101,9 @@ class UNet2DConditionModelEngine:
 
 
         # Handle ControlNet inputs if provided
-        if controlnet_conditioning is not None:
+        if getattr(self, 'use_fused_controlnet', False):
+            self._add_fused_controlnet_inputs(kwargs, latent_model_input, shape_dict, input_dict)
+        elif controlnet_conditioning is not None:
             # Option 1: Direct ControlNet conditioning dict (organized by type)
             self._add_controlnet_conditioning_dict(controlnet_conditioning, shape_dict, input_dict)
         elif down_block_additional_residuals is not None or mid_block_additional_residual is not None:
@@ -136,9 +140,9 @@ class UNet2DConditionModelEngine:
         if self.debug_vram:
             allocated_before = torch.cuda.memory_allocated() / 1024**3
             logger.debug(f"VRAM before allocation: {allocated_before:.2f}GB")
-        
+
         self.engine.allocate_buffers(shape_dict=shape_dict, device=latent_model_input.device)
-        
+
         if self.debug_vram:
             allocated_after = torch.cuda.memory_allocated() / 1024**3
             logger.debug(f"VRAM after allocation: {allocated_after:.2f}GB")
@@ -152,20 +156,104 @@ class UNet2DConditionModelEngine:
         except Exception as e:
             logger.exception(f"UNet2DConditionModelEngine.__call__: Engine.infer failed: {e}")
             raise
-        
-        
+
         if self.debug_vram:
             allocated_final = torch.cuda.memory_allocated() / 1024**3
             logger.debug(f"VRAM after inference: {allocated_final:.2f}GB")
-        
-       
-        
+
         noise_pred = outputs["latent"]
         if len(kvo_cache) > 0:
             kvo_cache_out = [outputs[f"kvo_cache_out_{i}"] for i in range(len(kvo_cache))]
         else:
             kvo_cache_out = []
         return noise_pred, kvo_cache_out
+
+    def _add_fused_controlnet_inputs(
+        self,
+        kwargs: Dict[str, Any],
+        latent_model_input: torch.Tensor,
+        shape_dict: Dict[str, Any],
+        input_dict: Dict[str, torch.Tensor],
+    ) -> None:
+        batch_size = latent_model_input.shape[0]
+        image_height = latent_model_input.shape[2] * 8
+        image_width = latent_model_input.shape[3] * 8
+        conditioning_channels = list(
+            getattr(self, "fused_controlnet_conditioning_channels", []) or []
+        )
+        fused_count = int(
+            getattr(self, "fused_controlnet_count", len(conditioning_channels)) or 0
+        )
+
+        for idx in range(fused_count):
+            cond_key = self._fused_control_cond_names[idx]
+            scale_key = self._fused_control_scale_names[idx]
+            channels = conditioning_channels[idx] if idx < len(conditioning_channels) else 3
+
+            cond_tensor = kwargs.get(cond_key)
+            if cond_tensor is None:
+                cond_tensor = torch.zeros(
+                    batch_size,
+                    channels,
+                    image_height,
+                    image_width,
+                    dtype=latent_model_input.dtype,
+                    device=latent_model_input.device,
+                )
+
+            scale_tensor = kwargs.get(scale_key)
+            if scale_tensor is None:
+                scale_tensor = torch.tensor(
+                    0.0, dtype=torch.float32, device=latent_model_input.device
+                )
+            elif not isinstance(scale_tensor, torch.Tensor):
+                scale_tensor = torch.tensor(
+                    float(scale_tensor),
+                    dtype=torch.float32,
+                    device=latent_model_input.device,
+                )
+            else:
+                scale_tensor = scale_tensor.to(
+                    device=latent_model_input.device, dtype=torch.float32
+                )
+
+            shape_dict[cond_key] = cond_tensor.shape
+            input_dict[cond_key] = cond_tensor
+            shape_dict[scale_key] = scale_tensor.shape
+            input_dict[scale_key] = scale_tensor
+
+        if getattr(self, "use_sdxl_added_cond", False):
+            text_embeds = kwargs.get("text_embeds")
+            if text_embeds is None:
+                text_embeds = torch.zeros(
+                    batch_size,
+                    1280,
+                    dtype=latent_model_input.dtype,
+                    device=latent_model_input.device,
+                )
+            else:
+                text_embeds = text_embeds.to(
+                    device=latent_model_input.device,
+                    dtype=latent_model_input.dtype,
+                )
+            time_ids = kwargs.get("time_ids")
+            if time_ids is None:
+                time_ids = torch.zeros(
+                    batch_size,
+                    6,
+                    dtype=latent_model_input.dtype,
+                    device=latent_model_input.device,
+                )
+            else:
+                time_ids = time_ids.to(
+                    device=latent_model_input.device,
+                    dtype=latent_model_input.dtype,
+                )
+
+            shape_dict["text_embeds"] = text_embeds.shape
+            input_dict["text_embeds"] = text_embeds
+            shape_dict["time_ids"] = time_ids.shape
+            input_dict["time_ids"] = time_ids
 
     def _add_controlnet_conditioning_dict(self, 
                                         controlnet_conditioning: Dict[str, List[torch.Tensor]], 

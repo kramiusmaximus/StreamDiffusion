@@ -107,6 +107,32 @@ class SDXLExportWrapper(torch.nn.Module):
         except Exception as e:
             logger.error(f"SDXL model does not support added_cond_kwargs: {e}")
             return False
+
+    def _extract_explicit_added_cond(self, args):
+        """Extract explicit SDXL conditioning from trailing positional args when present.
+
+        This preserves real ONNX/TRT inputs for wrappers that expose text_embeds/time_ids
+        positionally, such as the fused ControlNet+UNet export path.
+        """
+        if len(args) < 5:
+            return None, args
+
+        maybe_time_ids = args[-1]
+        maybe_text_embeds = args[-2]
+
+        if not isinstance(maybe_text_embeds, torch.Tensor) or not isinstance(maybe_time_ids, torch.Tensor):
+            return None, args
+
+        if maybe_text_embeds.dim() != 2 or maybe_time_ids.dim() != 2:
+            return None, args
+
+        if maybe_text_embeds.shape[-1] != 1280 or maybe_time_ids.shape[-1] != 6:
+            return None, args
+
+        return {
+            'text_embeds': maybe_text_embeds,
+            'time_ids': maybe_time_ids,
+        }, args[:-2]
         
     def forward(self, *args, **kwargs):
         """Forward pass that handles SDXL conditioning gracefully"""
@@ -114,6 +140,11 @@ class SDXLExportWrapper(torch.nn.Module):
             # Ensure added_cond_kwargs is never None to prevent TypeError
             if 'added_cond_kwargs' in kwargs and kwargs['added_cond_kwargs'] is None:
                 kwargs['added_cond_kwargs'] = {}
+
+            explicit_added_cond, stripped_args = self._extract_explicit_added_cond(args)
+            if explicit_added_cond is not None and 'added_cond_kwargs' not in kwargs:
+                kwargs['added_cond_kwargs'] = explicit_added_cond
+                args = stripped_args
             
             # Auto-generate SDXL conditioning if missing and model needs it
             if (len(args) >= 3 and 'added_cond_kwargs' not in kwargs and 
