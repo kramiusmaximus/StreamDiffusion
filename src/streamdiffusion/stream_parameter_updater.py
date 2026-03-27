@@ -1,5 +1,6 @@
 from typing import List, Optional, Dict, Tuple, Literal, Any, Callable
 import threading
+import time
 import torch
 import torch.nn.functional as F
 import gc
@@ -50,6 +51,25 @@ class StreamParameterUpdater(OrchestratorUser):
         self._current_style_images: Dict[str, Any] = {}
         # Use the shared orchestrator attached via OrchestratorUser
         self._embedding_orchestrator = self._preprocessing_orchestrator
+        self._profiling_alpha = 0.1
+        self._profiling_stats: Dict[str, float] = {}
+
+    def _record_profile_stat(self, name: str, value_ms: Optional[float]) -> None:
+        if value_ms is None:
+            return
+        try:
+            value_ms = float(value_ms)
+        except (TypeError, ValueError):
+            return
+        previous = self._profiling_stats.get(name)
+        if previous is None:
+            self._profiling_stats[name] = value_ms
+        else:
+            self._profiling_stats[name] = previous * (1.0 - self._profiling_alpha) + value_ms * self._profiling_alpha
+
+    def get_profiling_stats(self) -> Dict[str, float]:
+        return {key: round(value, 3) for key, value in self._profiling_stats.items()}
+
     def get_cache_info(self) -> Dict:
         """Get cache statistics for monitoring performance."""
         total_requests = self._prompt_cache_stats.hits + self._prompt_cache_stats.misses
@@ -165,6 +185,7 @@ class StreamParameterUpdater(OrchestratorUser):
         
         # Choose processing mode based on is_stream parameter
         try:
+            preprocess_start = time.perf_counter()
             if is_stream:
                 # Pipelined processing - optimized for throughput with 1-frame lag
                 embedding_results = self._embedding_orchestrator.process_pipelined(
@@ -186,6 +207,7 @@ class StreamParameterUpdater(OrchestratorUser):
                     None,
                     "ipadapter"
                 )
+            self._record_profile_stat("preprocess_ms", (time.perf_counter() - preprocess_start) * 1000.0)
             
             # Cache results for this style image key
             if embedding_results and embedding_results[0] is not None:
