@@ -131,6 +131,7 @@ class EngineManager:
                        lora_dict: Optional[Dict[str, float]] = None,
                        ipadapter_scale: Optional[float] = None,
                        ipadapter_tokens: Optional[int] = None,
+                       ipadapter_layer_policy: Optional[str] = None,
                        controlnet_model_id: Optional[str] = None,
                        is_faceid: Optional[bool] = None,
                        use_controlnet: Optional[bool] = None,
@@ -189,6 +190,14 @@ class EngineManager:
                 prefix += f"--fid"
             if ipadapter_tokens is not None:
                 prefix += f"--tokens{ipadapter_tokens}"
+            if (
+                engine_type == EngineType.UNET
+                and ipadapter_tokens is not None
+                and ipadapter_layer_policy is not None
+            ):
+                normalized_policy = str(ipadapter_layer_policy).strip().lower().replace("-", "_")
+                if normalized_policy and normalized_policy != "all":
+                    prefix += f"--iplayers-{normalized_policy}"
 
             # Fused Loras - use concise hashed signature to avoid long/invalid paths
             if lora_dict is not None and len(lora_dict) > 0:

@@ -1549,12 +1549,15 @@ class StreamDiffusionWrapper:
                 # Strength is now a runtime input, so we do NOT bake scale into engine identity
                 ipadapter_scale = None
                 ipadapter_tokens = None
+                ipadapter_layer_policy = "all"
                 if use_ipadapter_trt and has_ipadapter and ipadapter_config:
                     cfg0 = ipadapter_config[0] if isinstance(ipadapter_config, list) else ipadapter_config
                     # scale omitted from engine naming; runtime will pass ipadapter_scale vector
                     ipadapter_tokens = cfg0.get('num_image_tokens', 4)
+                    ipadapter_layer_policy = cfg0.get('layer_policy', 'all')
                     # Determine FaceID type from config for engine naming
                     is_faceid = (cfg0['type'] == 'faceid')
+                    logger.info(f"   IPAdapter layer policy: {ipadapter_layer_policy}")
 
                 specialized_unet_batch = stream.trt_unet_batch_size if trt_engine_profile == "specialized" else None
                 unet_engine_min_batch = specialized_unet_batch or self.min_batch_size
@@ -1571,6 +1574,7 @@ class StreamDiffusionWrapper:
                     lora_dict=lora_dict,
                     ipadapter_scale=ipadapter_scale,
                     ipadapter_tokens=ipadapter_tokens,
+                    ipadapter_layer_policy=ipadapter_layer_policy if use_ipadapter_trt else None,
                     is_faceid=is_faceid if use_ipadapter_trt else None,
                     use_controlnet=(use_controlnet_trt or use_fused_controlnet_trt),
                     use_fused_controlnet=use_fused_controlnet_trt,
@@ -1674,6 +1678,8 @@ class StreamDiffusionWrapper:
                             image_encoder_path=cfg['image_encoder_path'],
                             style_image=cfg.get('style_image'),
                             scale=cfg.get('scale', 1.0),
+                            weight_type=cfg.get('weight_type'),
+                            layer_policy=cfg.get('layer_policy', 'all'),
                             type=IPAdapterType(cfg.get('type', "regular")),
                             insightface_model_name=cfg.get('insightface_model_name'),
                         )
@@ -1754,6 +1760,7 @@ class StreamDiffusionWrapper:
                     use_ipadapter=use_ipadapter_trt,
                     control_input_names=None,
                     num_tokens=num_tokens,
+                    ipadapter_layer_policy=ipadapter_layer_policy,
                     fused_controlnets=fused_controlnet_models if use_fused_controlnet_trt else None,
                     fused_controlnet_conditioning_channels=fused_controlnet_conditioning_channels if use_fused_controlnet_trt else None,
                 )
@@ -1808,6 +1815,7 @@ class StreamDiffusionWrapper:
                     use_ipadapter=use_ipadapter_trt,
                     control_input_names=control_input_names,
                     num_tokens=num_tokens,
+                    ipadapter_layer_policy=ipadapter_layer_policy,
                     kvo_cache_structure=kvo_cache_structure,
                     fused_controlnets=fused_controlnet_models if use_fused_controlnet_trt else None,
                     fused_controlnet_conditioning_channels=fused_controlnet_conditioning_channels if use_fused_controlnet_trt else None,
@@ -2139,6 +2147,8 @@ class StreamDiffusionWrapper:
                     image_encoder_path=cfg['image_encoder_path'],
                     style_image=cfg.get('style_image'),
                     scale=cfg.get('scale', 1.0),
+                    weight_type=cfg.get('weight_type'),
+                    layer_policy=cfg.get('layer_policy', 'all'),
                     type=ipadapter_type,
                     insightface_model_name=cfg.get('insightface_model_name'),
                 )

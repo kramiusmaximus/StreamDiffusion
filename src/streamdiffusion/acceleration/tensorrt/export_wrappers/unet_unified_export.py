@@ -23,6 +23,7 @@ class UnifiedExportWrapper(torch.nn.Module):
         use_ipadapter: bool = False,
         control_input_names: Optional[List[str]] = None,
         num_tokens: int = 4,
+        ipadapter_layer_policy: str = "all",
         kvo_cache_structure: List[int] = [],
         fused_controlnets: Optional[List[torch.nn.Module]] = None,
         fused_controlnet_conditioning_channels: Optional[List[int]] = None,
@@ -52,7 +53,10 @@ class UnifiedExportWrapper(torch.nn.Module):
                 ipadapter_kwargs["install_processors"] = True
 
             self.ipadapter_wrapper = create_ipadapter_wrapper(
-                unet, num_tokens=num_tokens, **ipadapter_kwargs
+                unet,
+                num_tokens=num_tokens,
+                layer_policy=ipadapter_layer_policy,
+                **ipadapter_kwargs,
             )
             self.unet = self.ipadapter_wrapper.unet
 

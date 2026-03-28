@@ -222,6 +222,9 @@ def _prepare_ipadapter_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             'style_image': ip_config.get('style_image'),
             'scale': ip_config.get('scale', 1.0),
             'enabled': ip_config.get('enabled', True),
+            'num_image_tokens': ip_config.get('num_image_tokens', 4),
+            'weight_type': ip_config.get('weight_type'),
+            'layer_policy': ip_config.get('layer_policy', 'all'),
             # Preserve FaceID options from config for downstream wrapper/module handling
             'type': ip_config.get('type', 'regular'),
             'insightface_model_name': ip_config.get('insightface_model_name'),
@@ -429,6 +432,29 @@ def _validate_config(config: Dict[str, Any]) -> None:
             
             if 'image_encoder_path' not in ipadapter:
                 raise ValueError(f"_validate_config: IPAdapter {i} missing required 'image_encoder_path'")
+
+            if 'num_image_tokens' in ipadapter:
+                tokens = ipadapter['num_image_tokens']
+                if not isinstance(tokens, int) or tokens <= 0:
+                    raise ValueError(
+                        f"_validate_config: IPAdapter {i} 'num_image_tokens' must be a positive integer"
+                    )
+
+            if 'layer_policy' in ipadapter:
+                allowed_layer_policies = {
+                    'all',
+                    'mid_up',
+                    'up_only',
+                    'mid_only',
+                    'mid_down',
+                    'down_only',
+                }
+                layer_policy = str(ipadapter['layer_policy']).strip().lower().replace('-', '_')
+                if layer_policy not in allowed_layer_policies:
+                    raise ValueError(
+                        f"_validate_config: IPAdapter {i} 'layer_policy' must be one of "
+                        f"{sorted(allowed_layer_policies)}, got '{ipadapter['layer_policy']}'"
+                    )
 
     # Validate prompt blending configuration if present
     if 'prompt_blending' in config:

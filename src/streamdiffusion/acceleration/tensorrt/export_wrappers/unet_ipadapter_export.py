@@ -5,6 +5,15 @@ from typing import Optional, Dict, Any, List
 from ....model_detection import detect_model, detect_model_from_diffusers_unet
 from diffusers_ipadapter.ip_adapter.attention_processor import TRTIPAttnProcessor, TRTIPAttnProcessor2_0
 
+ALLOWED_IPADAPTER_LAYER_POLICIES = {
+    "all",
+    "mid_up",
+    "up_only",
+    "mid_only",
+    "mid_down",
+    "down_only",
+}
+
 
 class IPAdapterUNetExportWrapper(torch.nn.Module):
     """
@@ -15,12 +24,20 @@ class IPAdapterUNetExportWrapper(torch.nn.Module):
     The UNet expects concatenated embeddings (text + image) as encoder_hidden_states.
     """
     
-    def __init__(self, unet: UNet2DConditionModel, cross_attention_dim: int, num_tokens: int = 4, install_processors: bool = True):
+    def __init__(
+        self,
+        unet: UNet2DConditionModel,
+        cross_attention_dim: int,
+        num_tokens: int = 4,
+        install_processors: bool = True,
+        layer_policy: str = "all",
+    ):
         super().__init__()
         self.unet = unet
         self.num_image_tokens = num_tokens  # 4 for standard, 16 for plus
         self.cross_attention_dim = cross_attention_dim  # 768 for SD1.5, 2048 for SDXL
         self.install_processors = install_processors
+        self.layer_policy = self._normalize_layer_policy(layer_policy)
         
         # Convert to float32 BEFORE installing processors (to avoid resetting them)
         self.unet = self.unet.to(dtype=torch.float32)
@@ -37,6 +54,39 @@ class IPAdapterUNetExportWrapper(torch.nn.Module):
             self._install_ipadapter_processors()
         else:
             print("IPAdapterUNetExportWrapper: WARNING - UNet will not have IPAdapter functionality without processors!")
+
+    def _normalize_layer_policy(self, layer_policy: Optional[str]) -> str:
+        normalized = "all" if layer_policy is None else str(layer_policy).strip().lower().replace("-", "_")
+        if normalized not in ALLOWED_IPADAPTER_LAYER_POLICIES:
+            raise ValueError(
+                f"Unsupported IPAdapter layer policy '{layer_policy}'. "
+                f"Expected one of {sorted(ALLOWED_IPADAPTER_LAYER_POLICIES)}."
+            )
+        return normalized
+
+    def _use_ipadapter_for_layer(self, name: str) -> bool:
+        if self.layer_policy == "all":
+            return True
+        if name.startswith("mid_block"):
+            block_group = "mid"
+        elif name.startswith("up_blocks"):
+            block_group = "up"
+        elif name.startswith("down_blocks"):
+            block_group = "down"
+        else:
+            block_group = "other"
+
+        if self.layer_policy == "mid_up":
+            return block_group in {"mid", "up"}
+        if self.layer_policy == "up_only":
+            return block_group == "up"
+        if self.layer_policy == "mid_only":
+            return block_group == "mid"
+        if self.layer_policy == "mid_down":
+            return block_group in {"down", "mid"}
+        if self.layer_policy == "down_only":
+            return block_group == "down"
+        return True
     
     def _has_ipadapter_processors(self) -> bool:
         """Check if the UNet already has IPAdapter processors installed"""
@@ -68,25 +118,23 @@ class IPAdapterUNetExportWrapper(torch.nn.Module):
             
             for name, processor in processors.items():
                 processor_class = processor.__class__.__name__
-                if 'TRTIPAttn' in processor_class:
-                    # Already TRT processors: ensure dtype and record
-                    proc = processor.to(dtype=torch.float32)
-                    proc._scale_index = ip_layer_index
-                    self._ip_trt_processors.append(proc)
-                    ip_layer_index += 1
-                    updated_processors[name] = proc
-                elif 'IPAttn' in processor_class or 'IPAttnProcessor' in processor_class:
-                    # Replace standard processors with TRT variants, preserving weights where applicable
-                    hidden_size = getattr(processor, 'hidden_size', None)
-                    cross_attention_dim = getattr(processor, 'cross_attention_dim', None)
-                    num_tokens = getattr(processor, 'num_tokens', self.num_image_tokens)
-                    proc = IPProcClass(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, num_tokens=num_tokens)
-                    # Copy IP projection weights if present
-                    if hasattr(processor, 'to_k_ip') and hasattr(processor, 'to_v_ip') and hasattr(proc, 'to_k_ip'):
-                        with torch.no_grad():
-                            proc.to_k_ip.weight.copy_(processor.to_k_ip.weight.to(dtype=torch.float32))
-                            proc.to_v_ip.weight.copy_(processor.to_v_ip.weight.to(dtype=torch.float32))
-                    proc = proc.to(self.unet.device, dtype=torch.float32)
+                use_ipadapter = (
+                    not name.endswith("attn1.processor")
+                    and self._use_ipadapter_for_layer(name)
+                )
+                if use_ipadapter:
+                    if 'TRTIPAttn' in processor_class:
+                        proc = processor.to(dtype=torch.float32)
+                    else:
+                        hidden_size = getattr(processor, 'hidden_size', None)
+                        cross_attention_dim = getattr(processor, 'cross_attention_dim', None)
+                        num_tokens = getattr(processor, 'num_tokens', self.num_image_tokens)
+                        proc = IPProcClass(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, num_tokens=num_tokens)
+                        if hasattr(processor, 'to_k_ip') and hasattr(processor, 'to_v_ip') and hasattr(proc, 'to_k_ip'):
+                            with torch.no_grad():
+                                proc.to_k_ip.weight.copy_(processor.to_k_ip.weight.to(dtype=torch.float32))
+                                proc.to_v_ip.weight.copy_(processor.to_v_ip.weight.to(dtype=torch.float32))
+                        proc = proc.to(self.unet.device, dtype=torch.float32)
                     proc._scale_index = ip_layer_index
                     self._ip_trt_processors.append(proc)
                     ip_layer_index += 1
@@ -139,7 +187,7 @@ class IPAdapterUNetExportWrapper(torch.nn.Module):
                     # Fallback for any unexpected processor names
                     hidden_size = self.unet.config.block_out_channels[0]  # Use first block size as fallback
                 
-                if cross_attention_dim is None:
+                if cross_attention_dim is None or not self._use_ipadapter_for_layer(name):
                     # Self-attention layers use standard processors
                     attn_procs[name] = AttnProcessor()
                 else:
@@ -233,7 +281,12 @@ class IPAdapterUNetExportWrapper(torch.nn.Module):
         )
 
 
-def create_ipadapter_wrapper(unet: UNet2DConditionModel, num_tokens: int = 4, install_processors: bool = True) -> IPAdapterUNetExportWrapper:
+def create_ipadapter_wrapper(
+    unet: UNet2DConditionModel,
+    num_tokens: int = 4,
+    install_processors: bool = True,
+    layer_policy: str = "all",
+) -> IPAdapterUNetExportWrapper:
     """
     Create an IPAdapter wrapper with automatic architecture detection and baked-in processors.
     
@@ -268,8 +321,14 @@ def create_ipadapter_wrapper(unet: UNet2DConditionModel, num_tokens: int = 4, in
         
         expected_dim = expected_dims.get(model_type)
         
-        return IPAdapterUNetExportWrapper(unet, cross_attention_dim, num_tokens, install_processors)
+        return IPAdapterUNetExportWrapper(
+            unet,
+            cross_attention_dim,
+            num_tokens,
+            install_processors,
+            layer_policy,
+        )
         
     except Exception as e:
         print(f"create_ipadapter_wrapper: Error during model detection: {e}")
-        return IPAdapterUNetExportWrapper(unet, 768, num_tokens, install_processors) 
+        return IPAdapterUNetExportWrapper(unet, 768, num_tokens, install_processors, layer_policy) 

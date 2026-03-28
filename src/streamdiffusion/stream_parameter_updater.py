@@ -1572,6 +1572,7 @@ class StreamParameterUpdater(OrchestratorUser):
                 config.update({
                     'style_image_key': module_config.style_image_key,
                     'num_image_tokens': module_config.num_image_tokens,
+                    'layer_policy': getattr(module_config, 'layer_policy', 'all'),
                     'type': module_config.type.value,
                 })
             

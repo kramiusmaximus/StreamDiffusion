@@ -35,6 +35,7 @@ class IPAdapterConfig:
     style_image: Optional[Any] = None
     scale: float = 1.0
     weight_type: Optional[str] = None  # Weight type for per-layer scaling
+    layer_policy: str = "all"  # Compile-time TRT IPAdapter layer subset policy
     enabled: bool = True  # Runtime enable/disable state
 
     type: IPAdapterType = IPAdapterType.REGULAR
