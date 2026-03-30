@@ -1,3 +1,4 @@
+import inspect
 import os
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Union, Any, Tuple
@@ -97,6 +98,7 @@ class StreamDiffusionWrapper:
         skip_diffusion: bool = False,
         engine_dir: Optional[Union[str, Path]] = "engines",
         build_specialized_engine: bool = False,
+        quantize_fp8: bool = False,
         compile_engines_only: bool = False,
         build_engines_if_missing: bool = True,
         normalize_prompt_weights: bool = True,
@@ -288,8 +290,27 @@ class StreamDiffusionWrapper:
         self.dtype = dtype
         self.width = width
         self.height = height
+        normalized_cache_maxframes = max(1, int(cache_maxframes))
+        normalized_cache_interval = max(1, int(cache_interval))
+        normalized_min_cache_maxframes = max(1, min(int(min_cache_maxframes), normalized_cache_maxframes))
+        normalized_max_cache_maxframes = max(int(max_cache_maxframes), normalized_cache_maxframes)
+        if use_cached_attn and normalized_max_cache_maxframes != int(max_cache_maxframes):
+            logger.info(
+                "Expanding TensorRT cached-attention profile max from %s to %s to support cache_maxframes=%s",
+                max_cache_maxframes,
+                normalized_max_cache_maxframes,
+                normalized_cache_maxframes,
+            )
         self.build_specialized_engine = bool(build_specialized_engine)
         self.trt_engine_profile = self._resolve_trt_engine_profile(self.build_specialized_engine)
+        effective_quantize_fp8 = bool(quantize_fp8)
+        if acceleration == "tensorrt" and use_cached_attn and effective_quantize_fp8:
+            logger.warning(
+                "use_cached_attn currently forces fp16 TensorRT UNet precision. "
+                "Disabling quantize_fp8 for this run to avoid unstable cached-attention engine builds."
+            )
+            effective_quantize_fp8 = False
+        self.trt_precision = self._resolve_trt_precision(effective_quantize_fp8)
         self.mode = mode
         self.output_type = output_type
         self.frame_buffer_size = frame_buffer_size
@@ -320,6 +341,7 @@ class StreamDiffusionWrapper:
             cfg_type=cfg_type,
             engine_dir=engine_dir,
             build_specialized_engine=self.build_specialized_engine,
+            quantize_fp8=effective_quantize_fp8,
             build_engines_if_missing=build_engines_if_missing,
             normalize_prompt_weights=normalize_prompt_weights,
             normalize_seed_weights=normalize_seed_weights,
@@ -337,10 +359,10 @@ class StreamDiffusionWrapper:
             latent_postprocessing_config=latent_postprocessing_config,
             compile_engines_only=compile_engines_only,
             use_cached_attn=use_cached_attn,
-            cache_maxframes=cache_maxframes,
-            cache_interval=cache_interval,
-            min_cache_maxframes=min_cache_maxframes,
-            max_cache_maxframes=max_cache_maxframes,
+            cache_maxframes=normalized_cache_maxframes,
+            cache_interval=normalized_cache_interval,
+            min_cache_maxframes=normalized_min_cache_maxframes,
+            max_cache_maxframes=normalized_max_cache_maxframes,
         )
 
         # Store skip_diffusion on wrapper for execution flow control
@@ -387,6 +409,13 @@ class StreamDiffusionWrapper:
         """Resolve the internal TensorRT engine profile from the public boolean flag."""
         return "specialized" if build_specialized_engine else "general"
 
+    @staticmethod
+    def _resolve_trt_precision(
+        quantize_fp8: bool,
+    ) -> Literal["fp16", "fp8"]:
+        """Resolve the internal TensorRT precision mode from the public FP8 toggle."""
+        return "fp8" if bool(quantize_fp8) else "fp16"
+
     def _get_trt_engine_build_options(self, engine_kind: Literal["unet", "vae", "controlnet"]) -> Dict[str, Any]:
         """Build TensorRT profile options for the selected engine specialization mode."""
         if self.trt_engine_profile == "general":
@@ -394,10 +423,12 @@ class StreamDiffusionWrapper:
                 return {
                     'opt_image_height': self.height,
                     'opt_image_width': self.width,
+                    'trt_precision': self.trt_precision,
                 }
             return {
                 'opt_image_height': self.height,
                 'opt_image_width': self.width,
+                'trt_precision': 'fp16',
                 'build_dynamic_shape': True,
                 'build_static_batch': False,
                 'min_image_resolution': 384,
@@ -411,6 +442,7 @@ class StreamDiffusionWrapper:
         return {
             'opt_image_height': self.height,
             'opt_image_width': self.width,
+            'trt_precision': self.trt_precision if engine_kind == "unet" else 'fp16',
             'build_dynamic_shape': False,
             'build_static_batch': True,
             'min_image_resolution': min(self.height, self.width),
@@ -1036,6 +1068,7 @@ class StreamDiffusionWrapper:
         cfg_type: Literal["none", "full", "self", "initialize"] = "self",
         engine_dir: Optional[Union[str, Path]] = "engines",
         build_specialized_engine: bool = False,
+        quantize_fp8: bool = False,
         build_engines_if_missing: bool = True,
         normalize_prompt_weights: bool = True,
         normalize_seed_weights: bool = True,
@@ -1158,6 +1191,7 @@ class StreamDiffusionWrapper:
             logger.warning(f"GPU cleanup warning: {e}")
 
         trt_engine_profile = self._resolve_trt_engine_profile(bool(build_specialized_engine))
+        trt_precision = self._resolve_trt_precision(bool(quantize_fp8))
         
         # Reset CUDA context to prevent corruption from previous runs
         torch.cuda.empty_cache()
@@ -1286,6 +1320,24 @@ class StreamDiffusionWrapper:
                 self.use_lcm_lora = None
                 logger.info(f"use_lcm_lora has been removed from self")
 
+        if use_cached_attn and acceleration != "tensorrt":
+            try:
+                unet_forward_params = inspect.signature(pipe.unet.forward).parameters
+                if "kvo_cache" not in unet_forward_params:
+                    logger.warning(
+                        "use_cached_attn was requested, but the active UNet forward signature "
+                        "does not accept `kvo_cache`. Disabling cached attention for this run. "
+                        "The current TensorRT export path is not compatible with this diffusers UNet integration."
+                    )
+                    use_cached_attn = False
+            except Exception:
+                logger.warning(
+                    "use_cached_attn was requested, but UNet signature inspection failed. "
+                    "Disabling cached attention for this run to avoid TensorRT export failures.",
+                    exc_info=True,
+                )
+                use_cached_attn = False
+
         if use_cached_attn:
             from streamdiffusion.acceleration.tensorrt.models.utils import create_kvo_cache
             kvo_cache, kvo_cache_structure = create_kvo_cache(pipe.unet,
@@ -1413,6 +1465,16 @@ class StreamDiffusionWrapper:
                 engine_manager = EngineManager(engine_dir)
                 logger.info(f"TensorRT specialized engine build: {build_specialized_engine}")
                 logger.info(f"TensorRT engine profile: {trt_engine_profile}")
+                if trt_precision == "fp8":
+                    logger.info(
+                        "TensorRT UNet precision mode: fp8 (with fp16 fallback for unsupported layers)"
+                    )
+                    logger.info(
+                        "TensorRT VAE and standalone ControlNet engines remain fp16; "
+                        "fused ControlNet inside the UNet follows the UNet precision."
+                    )
+                else:
+                    logger.info("TensorRT UNet precision mode: fp16")
                 if build_specialized_engine:
                     logger.info(
                         f"TensorRT engine profile details: exact resolution {self.width}x{self.height} "
@@ -1580,6 +1642,9 @@ class StreamDiffusionWrapper:
                     use_fused_controlnet=use_fused_controlnet_trt,
                     fused_controlnet_model_ids=[cfg["model_id"] for cfg in normalized_controlnet_configs] if use_fused_controlnet_trt else None,
                     use_cached_attn=use_cached_attn,
+                    cache_maxframes=cache_maxframes if use_cached_attn else None,
+                    max_cache_maxframes=max_cache_maxframes if use_cached_attn else None,
+                    trt_precision=trt_precision,
                     trt_engine_profile=trt_engine_profile,
                     image_height=self.height,
                     image_width=self.width,
@@ -1893,6 +1958,7 @@ class StreamDiffusionWrapper:
                         fused_controlnet_conditioning_channels=fused_controlnet_conditioning_channels if use_fused_controlnet_trt else [],
                         fused_controlnet_count=len(fused_controlnet_conditioning_channels) if use_fused_controlnet_trt else 0,
                         use_sdxl_added_cond=is_sdxl if use_fused_controlnet_trt else False,
+                        trt_precision=trt_precision,
                         engine_build_options=self._get_trt_engine_build_options("unet")
                     )
                     if load_engine:
@@ -2411,7 +2477,7 @@ class StreamDiffusionWrapper:
                     
                     del self.stream.unet
                     logger.info("   UNet engine cleanup completed")
-                    
+
                 # Cleanup VAE TensorRT engines
                 if hasattr(self.stream, 'vae'):
                     vae_engine = self.stream.vae

@@ -676,7 +676,7 @@ class ControlNetModule(OrchestratorUser):
                 
                 # Get optimized SDXL conditioning (uses caching to avoid repeated tensor operations)
                 added_cond_kwargs = self._get_cached_sdxl_conditioning(ctx)
-                
+
                 try:
                     if is_trt_engine:
                         # TensorRT engine path

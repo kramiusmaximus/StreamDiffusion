@@ -234,6 +234,7 @@ class Engine:
         self,
         onnx_path,
         fp16,
+        trt_precision="fp16",
         input_profile=None,
         enable_refit=False,
         enable_all_tactics=False,
@@ -241,6 +242,15 @@ class Engine:
         workspace_size=0,
     ):
         logger.info(f"Building TensorRT engine for {onnx_path}: {self.engine_path}")
+        normalized_precision = str(trt_precision).strip().lower()
+        if normalized_precision not in {"fp16", "fp8"}:
+            raise ValueError(
+                f"Unsupported trt_precision '{trt_precision}'. Expected 'fp16' or 'fp8'."
+            )
+        if normalized_precision == "fp8":
+            logger.info("TensorRT builder precision: FP8 with FP16 fallback")
+        else:
+            logger.info("TensorRT builder precision: FP16")
         p = Profile()
         if input_profile:
             for name, dims in input_profile.items():
@@ -257,7 +267,12 @@ class Engine:
         engine = engine_from_network(
             network_from_onnx_path(onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM]),
             config=CreateConfig(
-                fp16=fp16, refittable=enable_refit, profiles=[p], load_timing_cache=timing_cache, **config_kwargs
+                fp16=fp16 or normalized_precision == "fp8",
+                fp8=normalized_precision == "fp8",
+                refittable=enable_refit,
+                profiles=[p],
+                load_timing_cache=timing_cache,
+                **config_kwargs
             ),
             save_timing_cache=timing_cache,
         )
@@ -567,6 +582,7 @@ def build_engine(
     opt_image_height: int,
     opt_image_width: int,
     opt_batch_size: int,
+    trt_precision: str = "fp16",
     build_static_batch: bool = False,
     build_dynamic_shape: bool = False,
     build_all_tactics: bool = False,
@@ -590,6 +606,7 @@ def build_engine(
     engine.build(
         onnx_opt_path,
         fp16=True,
+        trt_precision=trt_precision,
         input_profile=input_profile,
         enable_refit=build_enable_refit,
         enable_all_tactics=build_all_tactics,

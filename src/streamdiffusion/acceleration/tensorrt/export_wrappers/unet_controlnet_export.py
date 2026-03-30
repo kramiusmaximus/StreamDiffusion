@@ -3,7 +3,7 @@
 import torch
 from typing import List, Optional, Dict, Any
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
-from ..models.utils import convert_list_to_structure
+from ..models.attention_processors import active_kvo_cache_state
 
 
 class ControlNetUNetExportWrapper(torch.nn.Module):
@@ -83,18 +83,12 @@ class ControlNetUNetExportWrapper(torch.nn.Module):
                     down_block_controls = None
                     mid_block_control = None
         
-        formatted_kvo_cache = []
-        if len(kvo_cache) > 0:
-            formatted_kvo_cache = convert_list_to_structure(kvo_cache, self.kvo_cache_structure)
-
         unet_kwargs = {
             'sample': sample,
             'timestep': timestep,
             'encoder_hidden_states': encoder_hidden_states,
             'return_dict': False,
         }
-        if len(kvo_cache) > 0:
-            unet_kwargs['kvo_cache'] = formatted_kvo_cache
         
         # Pass through all additional kwargs (for SDXL models)
         unet_kwargs.update(kwargs)
@@ -114,13 +108,19 @@ class ControlNetUNetExportWrapper(torch.nn.Module):
             unet_kwargs['mid_block_additional_residual'] = adapted_mid_control
         
         try:
-            res = self.unet(**unet_kwargs)
             if len(kvo_cache) > 0:
-                return res
-            else:
-                return res[0]
+                with active_kvo_cache_state(list(kvo_cache)) as cache_state:
+                    res = self.unet(**unet_kwargs)
+                sample_out = res[0] if isinstance(res, (tuple, list)) else res
+                if len(cache_state.output_caches) != len(kvo_cache):
+                    raise RuntimeError(
+                        f"Cached attention export mismatch: expected {len(kvo_cache)} cache outputs, "
+                        f"got {len(cache_state.output_caches)}"
+                    )
+                return (sample_out, *cache_state.output_caches)
+            return self.unet(**unet_kwargs)[0]
         except Exception as e:
-            print(f"❌ DEBUG: UNet forward failed: {e}")
+            print(f"DEBUG: UNet forward failed: {e}")
             raise
     
     def _adapt_control_tensors(self, control_tensors, sample):
@@ -268,30 +268,29 @@ class MultiControlNetUNetExportWrapper(torch.nn.Module):
                 if scaled_mid is not None and combined_mid_control is not None:
                     combined_mid_control += scaled_mid
         
-        formatted_kvo_cache = []
-        if len(kvo_cache) > 0:
-            formatted_kvo_cache = convert_list_to_structure(kvo_cache, self.kvo_cache_structure)
-
         unet_kwargs = {
             'sample': sample,
             'timestep': timestep,
             'encoder_hidden_states': encoder_hidden_states,
             'return_dict': False,
         }
-        if len(kvo_cache) > 0:
-            unet_kwargs['kvo_cache'] = formatted_kvo_cache
         
         if combined_down_controls:
             unet_kwargs['down_block_additional_residuals'] = list(reversed(combined_down_controls))
         if combined_mid_control is not None:
             unet_kwargs['mid_block_additional_residual'] = combined_mid_control
         
-        res = self.unet(**unet_kwargs)
         if len(kvo_cache) > 0:
-            return res
-        else:
-            return res[0]
-        return res
+            with active_kvo_cache_state(list(kvo_cache)) as cache_state:
+                res = self.unet(**unet_kwargs)
+            sample_out = res[0] if isinstance(res, (tuple, list)) else res
+            if len(cache_state.output_caches) != len(kvo_cache):
+                raise RuntimeError(
+                    f"Cached attention export mismatch: expected {len(kvo_cache)} cache outputs, "
+                    f"got {len(cache_state.output_caches)}"
+                )
+            return (sample_out, *cache_state.output_caches)
+        return self.unet(**unet_kwargs)[0]
 
 
 def create_controlnet_wrapper(unet: UNet2DConditionModel, 

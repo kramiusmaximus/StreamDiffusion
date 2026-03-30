@@ -1,11 +1,50 @@
-from typing import Optional
+from contextlib import contextmanager
+from typing import Any, List, Optional
 
 import torch
 import torch.nn.functional as F
 
 from diffusers.models.attention_processor import Attention
 from diffusers.utils import USE_PEFT_BACKEND
-    
+
+
+class KVOCacheState:
+    def __init__(self, input_caches: Optional[List[torch.Tensor]] = None):
+        self.input_caches = list(input_caches or [])
+        self.output_caches: List[torch.Tensor] = []
+        self.input_index = 0
+
+    def next_input(self) -> Optional[torch.Tensor]:
+        if self.input_index >= len(self.input_caches):
+            self.input_index += 1
+            return None
+        cache = self.input_caches[self.input_index]
+        self.input_index += 1
+        return cache
+
+    def record_output(self, cache_tensor: torch.Tensor) -> None:
+        self.output_caches.append(cache_tensor)
+
+
+_ACTIVE_KVO_CACHE_STATE: Optional[KVOCacheState] = None
+
+
+@contextmanager
+def active_kvo_cache_state(input_caches: Optional[List[torch.Tensor]] = None):
+    global _ACTIVE_KVO_CACHE_STATE
+    previous_state = _ACTIVE_KVO_CACHE_STATE
+    state = KVOCacheState(input_caches)
+    _ACTIVE_KVO_CACHE_STATE = state
+    try:
+        yield state
+    finally:
+        _ACTIVE_KVO_CACHE_STATE = previous_state
+
+
+def get_active_kvo_cache_state() -> Optional[KVOCacheState]:
+    return _ACTIVE_KVO_CACHE_STATE
+
+
 class CachedSTAttnProcessor2_0:
     r"""
     Processor for implementing scaled dot-product attention (enabled by default if you're using PyTorch 2.0).
@@ -24,6 +63,7 @@ class CachedSTAttnProcessor2_0:
         temb: Optional[torch.FloatTensor] = None,
         scale: float = 1.0,
         kvo_cache: Optional[torch.FloatTensor] = None,
+        kvo_cache_state: Optional[Any] = None,
     ) -> torch.FloatTensor:
         residual = hidden_states
         if attn.spatial_norm is not None:
@@ -57,6 +97,10 @@ class CachedSTAttnProcessor2_0:
             encoder_hidden_states = hidden_states
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        active_state = kvo_cache_state or get_active_kvo_cache_state()
+        if is_selfattn and kvo_cache is None and active_state is not None:
+            kvo_cache = active_state.next_input()
 
         key = attn.to_k(encoder_hidden_states, *args)
         value = attn.to_v(encoder_hidden_states, *args)
@@ -108,6 +152,8 @@ class CachedSTAttnProcessor2_0:
         hidden_states = hidden_states / attn.rescale_output_factor
             
         if is_selfattn:
-            kvo_cache = torch.stack([curr_key.unsqueeze(0), curr_value.unsqueeze(0)], dim=0)
-                
-        return hidden_states, kvo_cache
+            cache_tensor = torch.stack([curr_key.unsqueeze(0), curr_value.unsqueeze(0)], dim=0)
+            if active_state is not None:
+                active_state.record_output(cache_tensor)
+
+        return hidden_states

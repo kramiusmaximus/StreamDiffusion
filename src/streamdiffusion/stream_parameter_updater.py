@@ -391,6 +391,17 @@ class StreamParameterUpdater(OrchestratorUser):
                     logger.info(f"update_stream_params: Cache interval set to {cache_interval}")
 
                 if cache_maxframes is not None:
+                    cache_maxframes = max(1, int(cache_maxframes))
+                    runtime_cache_limit = getattr(self.stream.unet, "max_cache_maxframes", None)
+                    if runtime_cache_limit is not None and cache_maxframes > runtime_cache_limit:
+                        logger.warning(
+                            "update_stream_params: Requested cache_maxframes=%s exceeds the loaded TensorRT engine profile max of %s. "
+                            "Clamping to %s. Restart/rebuild is required for a larger cached-attention window.",
+                            cache_maxframes,
+                            runtime_cache_limit,
+                            runtime_cache_limit,
+                        )
+                        cache_maxframes = int(runtime_cache_limit)
                     old_cache_maxframes = self.stream.cache_maxframes
                     self.stream.cache_maxframes = cache_maxframes
                     if old_cache_maxframes != cache_maxframes:

@@ -126,6 +126,7 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
             'build_specialized_engine',
             legacy_trt_profile in ['specialized', 'precise'],
         ),
+        'quantize_fp8': config.get('quantize_fp8', False),
         'normalize_prompt_weights': config.get('normalize_prompt_weights', True),
         'normalize_seed_weights': config.get('normalize_seed_weights', True),
         'scheduler': config.get('scheduler', 'lcm'),
@@ -534,3 +535,7 @@ def _validate_config(config: Dict[str, Any]) -> None:
         if trt_engine_profile.lower() not in ['general', 'specialized', 'precise']:
             raise ValueError("_validate_config: 'trt_engine_profile' must be one of: general, specialized, precise")
 
+    if 'quantize_fp8' in config:
+        quantize_fp8 = config['quantize_fp8']
+        if not isinstance(quantize_fp8, bool):
+            raise ValueError("_validate_config: 'quantize_fp8' must be a boolean")

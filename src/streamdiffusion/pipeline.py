@@ -178,8 +178,10 @@ class StreamDiffusion:
             logger.warning(f"Unknown scheduler type '{scheduler_type}', falling back to LCM")
             return LCMScheduler.from_config(config, **sampler_params)
 
-    def _check_unet_tensorrt(self) -> bool:
+    def _check_unet_tensorrt(self, unet_module: Optional[Any] = None) -> bool:
         """Cache TensorRT detection to avoid repeated hasattr calls"""
+        if unet_module is not None and unet_module is not self.unet:
+            return hasattr(unet_module, 'engine') and hasattr(unet_module, 'stream')
         if self._is_unet_tensorrt is None:
             self._is_unet_tensorrt = hasattr(self.unet, 'engine') and hasattr(self.unet, 'stream')
         return self._is_unet_tensorrt
@@ -640,7 +642,12 @@ class StreamDiffusion:
         x_t_latent: torch.Tensor,
         t_list: Union[torch.Tensor, list[int]],
         idx: Optional[int] = None,
+        unet_override: Optional[Any] = None,
+        kvo_cache_override: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        active_unet = unet_override if unet_override is not None else self.unet
+        active_kvo_cache = self.kvo_cache if kvo_cache_override is None else kvo_cache_override
+
         if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
             x_t_latent_plus_uc = torch.concat([x_t_latent[0:1], x_t_latent], dim=0)
             t_list = torch.concat([t_list[0:1], t_list], dim=0)
@@ -732,7 +739,7 @@ class StreamDiffusion:
                 added_cond_kwargs = unet_kwargs.get('added_cond_kwargs', {})
                 
                 # Check if this is a TensorRT engine or PyTorch UNet
-                is_tensorrt_engine = self._check_unet_tensorrt()
+                is_tensorrt_engine = self._check_unet_tensorrt(active_unet)
                 
                 if is_tensorrt_engine:
                     # TensorRT engine expects positional args + kwargs. IP-Adapter scale vector, if any, is provided by hooks via extra_unet_kwargs
@@ -746,16 +753,17 @@ class StreamDiffusion:
                     if hook_mid_res is not None:
                         extra_kwargs['mid_block_additional_residual'] = hook_mid_res
 
-                    model_pred, kvo_cache_out = self.unet(
+                    model_pred, kvo_cache_out = active_unet(
                         unet_kwargs['sample'],                    # latent_model_input (positional)
                         unet_kwargs['timestep'],                  # timestep (positional)
                         unet_kwargs['encoder_hidden_states'],     # encoder_hidden_states (positional)
-                        kvo_cache=self.kvo_cache,
+                        kvo_cache=active_kvo_cache,
                         **extra_kwargs,
                         # For TRT engines, ensure SDXL cond shapes match engine builds; if engine expects 81 tokens (77+4), append dummy image tokens when none
                         **added_cond_kwargs                       # SDXL conditioning as kwargs
                     )
-                    self.update_kvo_cache(kvo_cache_out)
+                    if active_kvo_cache is self.kvo_cache:
+                        self.update_kvo_cache(kvo_cache_out)
                 else:
                     # PyTorch UNet expects diffusers-style named arguments. Any processor scaling is handled by IP-Adapter hook
 
@@ -771,7 +779,7 @@ class StreamDiffusion:
                         call_kwargs['down_block_additional_residuals'] = hook_down_res
                     if hook_mid_res is not None:
                         call_kwargs['mid_block_additional_residual'] = hook_mid_res
-                    model_pred = self.unet(**call_kwargs)[0]
+                    model_pred = active_unet(**call_kwargs)[0]
                     # No restoration for per-layer scale; next step will set again via updater/time factor
                 
             except Exception as e:
@@ -794,15 +802,16 @@ class StreamDiffusion:
             if hook_mid_res is not None:
                 ip_scale_kw['mid_block_additional_residual'] = hook_mid_res
 
-            model_pred, kvo_cache_out = self.unet(
+            model_pred, kvo_cache_out = active_unet(
                 x_t_latent_plus_uc,
                 t_list,
                 encoder_hidden_states=self.prompt_embeds,
-                kvo_cache=self.kvo_cache,
+                kvo_cache=active_kvo_cache,
                 return_dict=False,
                 **ip_scale_kw,
             )
-            self.update_kvo_cache(kvo_cache_out)
+            if active_kvo_cache is self.kvo_cache:
+                self.update_kvo_cache(kvo_cache_out)
 
         if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
             noise_pred_text = model_pred[1:]
@@ -873,7 +882,7 @@ class StreamDiffusion:
                 self.kvo_cache[i] = torch.roll(self.kvo_cache[i], shifts=-1, dims=1)
             self.kvo_cache[i][:, -1] = new_kv.squeeze(1)
 
-    def encode_image(self, image_tensors: torch.Tensor) -> torch.Tensor:
+    def _encode_image_latent(self, image_tensors: torch.Tensor) -> torch.Tensor:
         image_tensors = image_tensors.to(
             device=self.device,
             dtype=self.vae.dtype,
@@ -882,10 +891,59 @@ class StreamDiffusion:
         img_latent = retrieve_latents(self.vae.encode(image_tensors), self.generator)
         
         img_latent = img_latent * self.vae.config.scaling_factor
+        return img_latent
+
+    def encode_image(self, image_tensors: torch.Tensor) -> torch.Tensor:
+        img_latent = self._encode_image_latent(image_tensors)
         
         x_t_latent = self.add_noise(img_latent, self.init_noise[0], 0)
         
         return x_t_latent
+
+    def _get_step_slice(self, step_idx: int) -> slice:
+        start = step_idx * self.frame_bff_size
+        end = start + self.frame_bff_size
+        return slice(start, end)
+
+    def _get_step_timestep_tensor(self, step_idx: int, batch_size: int) -> torch.Tensor:
+        timestep = self.sub_timesteps[step_idx]
+        if not isinstance(timestep, torch.Tensor):
+            timestep_tensor = torch.tensor(
+                timestep, device=self.device, dtype=torch.long
+            )
+        else:
+            timestep_tensor = timestep.to(self.device, dtype=torch.long)
+        return timestep_tensor.view(1).repeat(batch_size)
+
+    def _seed_denoising_buffer_from_latent(
+        self, x_0_pred_out: torch.Tensor, start_step_idx: int
+    ) -> None:
+        if not self.use_denoising_batch or self.denoising_steps_num <= 1:
+            self.x_t_latent_buffer = None
+            return
+
+        seeded_latents: List[torch.Tensor] = []
+        for step_idx in range(start_step_idx, self.denoising_steps_num):
+            step_slice = self._get_step_slice(step_idx)
+            alpha = self.alpha_prod_t_sqrt[step_slice]
+            if self.do_add_noise:
+                beta = self.beta_prod_t_sqrt[step_slice]
+                noise = self.init_noise[step_slice]
+                seeded_latents.append(alpha * x_0_pred_out + beta * noise)
+            else:
+                seeded_latents.append(alpha * x_0_pred_out)
+
+        expected_latents = self.denoising_steps_num - 1
+        if not seeded_latents:
+            seeded_latents.append(x_0_pred_out.detach().clone())
+
+        while len(seeded_latents) < expected_latents:
+            seeded_latents.append(seeded_latents[-1].detach().clone())
+
+        self.x_t_latent_buffer = torch.cat(seeded_latents[:expected_latents], dim=0)
+
+        if self.stock_noise.shape == self.init_noise.shape:
+            self.stock_noise = torch.zeros_like(self.init_noise)
 
     def decode_image(self, x_0_pred_out: torch.Tensor) -> torch.Tensor:
         
@@ -999,7 +1057,7 @@ class StreamDiffusion:
         
         # LATENT POSTPROCESSING HOOKS: After diffusion, before VAE decoding
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
-        
+
         # Store latent result for latent feedback processors
         self.prev_latent_result = x_0_pred_out.detach().clone()
 

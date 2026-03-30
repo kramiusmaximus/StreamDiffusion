@@ -145,9 +145,12 @@ class SDXLExportWrapper(torch.nn.Module):
             if explicit_added_cond is not None and 'added_cond_kwargs' not in kwargs:
                 kwargs['added_cond_kwargs'] = explicit_added_cond
                 args = stripped_args
+
+            wrapped_handles_positional_added_cond = hasattr(self.unet, "_extract_sdxl_added_cond")
             
             # Auto-generate SDXL conditioning if missing and model needs it
             if (len(args) >= 3 and 'added_cond_kwargs' not in kwargs and 
+                not wrapped_handles_positional_added_cond and
                 hasattr(self.base_unet.config, 'addition_embed_type') and 
                 self.base_unet.config.addition_embed_type == 'text_time'):
                 
@@ -178,7 +181,7 @@ class SDXLExportWrapper(torch.nn.Module):
                 # Handle SDXL-Turbo models that need proper conditioning
                 logger.info(f"Providing minimal SDXL conditioning due to: {e}")
                 if len(args) >= 3:
-                    sample, timestep, encoder_hidden_states = args[0], args[1], args[2]
+                    sample = args[0]
                     device = sample.device
                     batch_size = sample.shape[0]
                     
@@ -187,14 +190,17 @@ class SDXLExportWrapper(torch.nn.Module):
                         'text_embeds': torch.zeros(batch_size, 1280, device=device, dtype=sample.dtype),
                         'time_ids': torch.zeros(batch_size, 6, device=device, dtype=sample.dtype)
                     }
-                    
+
+                    fallback_kwargs = dict(kwargs)
+                    fallback_kwargs['added_cond_kwargs'] = minimal_conditioning
+
                     try:
-                        return self.unet(sample, timestep, encoder_hidden_states, added_cond_kwargs=minimal_conditioning)
+                        return self.unet(*args, **fallback_kwargs)
                     except Exception as final_e:
-                        logger.info(f"Final fallback to basic call: {final_e}")
-                        return self.unet(sample, timestep, encoder_hidden_states)
+                        logger.info(f"Final fallback to passthrough call: {final_e}")
+                        return self.unet(*args, **kwargs)
                 else:
-                    return self.unet(*args)
+                    return self.unet(*args, **kwargs)
             else:
                 raise e
             
@@ -313,7 +319,7 @@ class SDXLConditioningHandler:
                     
         except Exception as e:
             # If testing fails completely, provide safe defaults
-            print(f"⚠️ UNet conditioning test setup failed: {e}")
+            print(f"WARNING: UNet conditioning test setup failed: {e}")
             results = {
                 'basic': True,  # Assume basic call works
                 'added_cond_kwargs': self.is_sdxl,  # Assume SDXL models support this

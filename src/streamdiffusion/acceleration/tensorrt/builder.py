@@ -50,6 +50,7 @@ class EngineBuilder:
         force_engine_build: bool = False,
         force_onnx_export: bool = False,
         force_onnx_optimize: bool = False,
+        trt_precision: str = "fp16",
     ):
         if not force_onnx_export and os.path.exists(onnx_path):
             print(f"Found cached model: {onnx_path}")
@@ -106,6 +107,7 @@ class EngineBuilder:
                 opt_image_height=opt_image_height,
                 opt_image_width=opt_image_width,
                 opt_batch_size=opt_batch_size,
+                trt_precision=trt_precision,
                 build_static_batch=build_static_batch,
                 build_dynamic_shape=build_dynamic_shape,
                 build_all_tactics=build_all_tactics,

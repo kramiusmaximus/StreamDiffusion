@@ -6,7 +6,7 @@ from diffusers import UNet2DConditionModel
 
 from .unet_controlnet_export import create_controlnet_wrapper
 from .unet_ipadapter_export import create_ipadapter_wrapper
-from ..models.utils import convert_list_to_structure
+from ..models.attention_processors import active_kvo_cache_state
 
 logger = logging.getLogger(__name__)
 
@@ -118,12 +118,6 @@ class UnifiedExportWrapper(torch.nn.Module):
     def _basic_unet_forward(
         self, sample, timestep, encoder_hidden_states, *kvo_cache, **kwargs
     ):
-        formatted_kvo_cache = []
-        if len(kvo_cache) > 0:
-            formatted_kvo_cache = convert_list_to_structure(
-                kvo_cache, self.kvo_cache_structure
-            )
-
         unet_kwargs = {
             "sample": sample,
             "timestep": timestep,
@@ -131,12 +125,24 @@ class UnifiedExportWrapper(torch.nn.Module):
             "return_dict": False,
             **kwargs,
         }
-        if len(kvo_cache) > 0:
-            unet_kwargs["kvo_cache"] = formatted_kvo_cache
-        res = self.unet(**unet_kwargs)
-        if len(kvo_cache) > 0:
-            return res
-        return res[0]
+        return self._run_unet_with_optional_kvo(unet_kwargs, kvo_cache)
+
+    def _run_unet_with_optional_kvo(
+        self, unet_kwargs: Dict[str, Any], flat_kvo_cache: Tuple[torch.Tensor, ...]
+    ):
+        if len(flat_kvo_cache) == 0:
+            return self.unet(**unet_kwargs)[0]
+
+        with active_kvo_cache_state(list(flat_kvo_cache)) as cache_state:
+            res = self.unet(**unet_kwargs)
+
+        sample = res[0] if isinstance(res, (tuple, list)) else res
+        if len(cache_state.output_caches) != len(flat_kvo_cache):
+            raise RuntimeError(
+                f"Cached attention export mismatch: expected {len(flat_kvo_cache)} cache outputs, "
+                f"got {len(cache_state.output_caches)}"
+            )
+        return (sample, *cache_state.output_caches)
 
     def _extract_sdxl_added_cond(
         self,
@@ -255,12 +261,6 @@ class UnifiedExportWrapper(torch.nn.Module):
         added_cond_kwargs, remaining_args = self._extract_sdxl_added_cond(
             sample, remaining_args, kwargs
         )
-        formatted_kvo_cache = []
-        if len(remaining_args) > 0:
-            formatted_kvo_cache = convert_list_to_structure(
-                remaining_args, self.kvo_cache_structure
-            )
-
         merged_down, merged_mid = self._run_fused_controlnets(
             sample,
             timestep,
@@ -278,8 +278,6 @@ class UnifiedExportWrapper(torch.nn.Module):
         }
         if added_cond_kwargs is not None:
             unet_kwargs["added_cond_kwargs"] = added_cond_kwargs
-        if len(formatted_kvo_cache) > 0:
-            unet_kwargs["kvo_cache"] = formatted_kvo_cache
         if merged_down is not None:
             unet_kwargs["down_block_additional_residuals"] = merged_down
         if merged_mid is not None:
@@ -287,10 +285,7 @@ class UnifiedExportWrapper(torch.nn.Module):
         if kwargs:
             unet_kwargs.update(kwargs)
 
-        res = self.unet(**unet_kwargs)
-        if len(formatted_kvo_cache) > 0:
-            return res
-        return res[0]
+        return self._run_unet_with_optional_kvo(unet_kwargs, remaining_args)
 
     def forward(
         self,
