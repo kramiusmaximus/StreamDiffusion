@@ -101,6 +101,7 @@ class CachedSTAttnProcessor2_0:
         active_state = kvo_cache_state or get_active_kvo_cache_state()
         if is_selfattn and kvo_cache is None and active_state is not None:
             kvo_cache = active_state.next_input()
+        kvo_cache_out = None
 
         key = attn.to_k(encoder_hidden_states, *args)
         value = attn.to_v(encoder_hidden_states, *args)
@@ -152,8 +153,8 @@ class CachedSTAttnProcessor2_0:
         hidden_states = hidden_states / attn.rescale_output_factor
             
         if is_selfattn:
-            cache_tensor = torch.stack([curr_key.unsqueeze(0), curr_value.unsqueeze(0)], dim=0)
+            kvo_cache_out = torch.stack([curr_key.unsqueeze(0), curr_value.unsqueeze(0)], dim=0)
             if active_state is not None:
-                active_state.record_output(cache_tensor)
+                active_state.record_output(kvo_cache_out)
 
-        return hidden_states
+        return hidden_states, kvo_cache_out

@@ -98,6 +98,8 @@ class UNet2DConditionModelEngine:
             shape_dict["ipadapter_scale"] = ip_scale.shape
             input_dict["ipadapter_scale"] = ip_scale
             
+        if getattr(self, 'use_sdxl_added_cond', False) and not getattr(self, 'use_fused_controlnet', False):
+            self._add_sdxl_added_cond_inputs(kwargs, latent_model_input, shape_dict, input_dict)
 
 
         # Handle ControlNet inputs if provided
@@ -223,37 +225,47 @@ class UNet2DConditionModelEngine:
             input_dict[scale_key] = scale_tensor
 
         if getattr(self, "use_sdxl_added_cond", False):
-            text_embeds = kwargs.get("text_embeds")
-            if text_embeds is None:
-                text_embeds = torch.zeros(
-                    batch_size,
-                    1280,
-                    dtype=latent_model_input.dtype,
-                    device=latent_model_input.device,
-                )
-            else:
-                text_embeds = text_embeds.to(
-                    device=latent_model_input.device,
-                    dtype=latent_model_input.dtype,
-                )
-            time_ids = kwargs.get("time_ids")
-            if time_ids is None:
-                time_ids = torch.zeros(
-                    batch_size,
-                    6,
-                    dtype=latent_model_input.dtype,
-                    device=latent_model_input.device,
-                )
-            else:
-                time_ids = time_ids.to(
-                    device=latent_model_input.device,
-                    dtype=latent_model_input.dtype,
-                )
+            self._add_sdxl_added_cond_inputs(kwargs, latent_model_input, shape_dict, input_dict)
 
-            shape_dict["text_embeds"] = text_embeds.shape
-            input_dict["text_embeds"] = text_embeds
-            shape_dict["time_ids"] = time_ids.shape
-            input_dict["time_ids"] = time_ids
+    def _add_sdxl_added_cond_inputs(
+        self,
+        kwargs: Dict[str, Any],
+        latent_model_input: torch.Tensor,
+        shape_dict: Dict[str, Any],
+        input_dict: Dict[str, torch.Tensor],
+    ) -> None:
+        batch_size = latent_model_input.shape[0]
+        text_embeds = kwargs.get("text_embeds")
+        if text_embeds is None:
+            text_embeds = torch.zeros(
+                batch_size,
+                1280,
+                dtype=latent_model_input.dtype,
+                device=latent_model_input.device,
+            )
+        else:
+            text_embeds = text_embeds.to(
+                device=latent_model_input.device,
+                dtype=latent_model_input.dtype,
+            )
+        time_ids = kwargs.get("time_ids")
+        if time_ids is None:
+            time_ids = torch.zeros(
+                batch_size,
+                6,
+                dtype=latent_model_input.dtype,
+                device=latent_model_input.device,
+            )
+        else:
+            time_ids = time_ids.to(
+                device=latent_model_input.device,
+                dtype=latent_model_input.dtype,
+            )
+
+        shape_dict["text_embeds"] = text_embeds.shape
+        input_dict["text_embeds"] = text_embeds
+        shape_dict["time_ids"] = time_ids.shape
+        input_dict["time_ids"] = time_ids
 
     def _add_controlnet_conditioning_dict(self, 
                                         controlnet_conditioning: Dict[str, List[torch.Tensor]], 

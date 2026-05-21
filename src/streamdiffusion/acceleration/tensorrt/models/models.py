@@ -523,6 +523,9 @@ class UNet(BaseModel):
                 logging.getLogger(__name__).debug(f"TRT Models: get_input_names with ipadapter -> {base_names}")
             except Exception:
                 pass
+        if self.use_sdxl_added_cond and not self.use_fused_controlnet:
+            base_names.append("text_embeds")
+            base_names.append("time_ids")
         if self.use_fused_controlnet:
             for idx in range(self.num_fused_controlnets):
                 base_names.append(f"controlnet_cond_{idx:02d}")
@@ -652,6 +655,17 @@ class UNet(BaseModel):
                 logging.getLogger(__name__).debug(f"TRT Models: profile ipadapter_scale min/opt/max={(1,),(self.num_ip_layers,),(self.num_ip_layers,)}")
             except Exception:
                 pass
+        if self.use_sdxl_added_cond and not self.use_fused_controlnet:
+            profile["text_embeds"] = [
+                (min_batch, 1280),
+                (batch_size, 1280),
+                (max_batch, 1280),
+            ]
+            profile["time_ids"] = [
+                (min_batch, 6),
+                (batch_size, 6),
+                (max_batch, 6),
+            ]
         if self.use_fused_controlnet:
             for idx, channels in enumerate(self.fused_controlnet_conditioning_channels):
                 profile[f"controlnet_cond_{idx:02d}"] = [
@@ -719,10 +733,10 @@ class UNet(BaseModel):
     def get_shape_dict(self, batch_size, image_height, image_width):
         latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
         shape_dict = {
-            "sample": (2 * batch_size, self.unet_dim, latent_height, latent_width),
-            "timestep": (2 * batch_size,),
-            "encoder_hidden_states": (2 * batch_size, self.text_maxlen, self.embedding_dim),
-            "latent": (2 * batch_size, 4, latent_height, latent_width),
+            "sample": (batch_size, self.unet_dim, latent_height, latent_width),
+            "timestep": (batch_size,),
+            "encoder_hidden_states": (batch_size, self.text_maxlen, self.embedding_dim),
+            "latent": (batch_size, 4, latent_height, latent_width),
         }
         if self.use_ipadapter:
             shape_dict["ipadapter_scale"] = (self.num_ip_layers,)
@@ -731,13 +745,16 @@ class UNet(BaseModel):
                 logging.getLogger(__name__).debug(f"TRT Models: shape_dict ipadapter_scale={(self.num_ip_layers,)}")
             except Exception:
                 pass
+        if self.use_sdxl_added_cond and not self.use_fused_controlnet:
+            shape_dict["text_embeds"] = (batch_size, 1280)
+            shape_dict["time_ids"] = (batch_size, 6)
         if self.use_fused_controlnet:
             for idx, channels in enumerate(self.fused_controlnet_conditioning_channels):
-                shape_dict[f"controlnet_cond_{idx:02d}"] = (2 * batch_size, channels, image_height, image_width)
+                shape_dict[f"controlnet_cond_{idx:02d}"] = (batch_size, channels, image_height, image_width)
                 shape_dict[f"conditioning_scale_{idx:02d}"] = ()
             if self.use_sdxl_added_cond:
-                shape_dict["text_embeds"] = (2 * batch_size, 1280)
-                shape_dict["time_ids"] = (2 * batch_size, 6)
+                shape_dict["text_embeds"] = (batch_size, 1280)
+                shape_dict["time_ids"] = (batch_size, 6)
         
         if self.use_control and self.control_inputs:
             # Use the actual calculated spatial dimensions for each ControlNet input
@@ -745,7 +762,7 @@ class UNet(BaseModel):
                 channels = shape_spec["channels"]
                 control_height = shape_spec["height"]
                 control_width = shape_spec["width"]
-                shape_dict[name] = (2 * batch_size, channels, control_height, control_width)
+                shape_dict[name] = (batch_size, channels, control_height, control_width)
 
         if self.use_cached_attn:
             for in_name, out_name, shape in zip(self.get_kvo_cache_names("in"), self.get_kvo_cache_names("out"), self.get_kvo_cache_shapes):
@@ -767,26 +784,44 @@ class UNet(BaseModel):
         
         dtype = torch.float16 if self.fp16 else torch.float32
         
-        # Use smaller batch size for memory efficiency during ONNX export
-        export_batch_size = min(batch_size, 1)  # Use batch size 1 for ONNX export to save memory
+        # The traced ONNX batch dimension must match the TensorRT profile. The
+        # caller passes the actual UNet runtime batch, including any CFG expansion.
+        export_batch_size = batch_size
         
         base_inputs = [
             torch.randn(
-                2 * export_batch_size, self.unet_dim, latent_height, latent_width, 
+                export_batch_size, self.unet_dim, latent_height, latent_width, 
                 dtype=torch.float32, device=self.device
             ),
-            torch.ones((2 * export_batch_size,), dtype=torch.float32, device=self.device),
-            torch.randn(2 * export_batch_size, self.text_maxlen, self.embedding_dim, dtype=dtype, device=self.device),
+            torch.ones((export_batch_size,), dtype=torch.float32, device=self.device),
+            torch.randn(export_batch_size, self.text_maxlen, self.embedding_dim, dtype=dtype, device=self.device),
         ]
         
         if self.use_ipadapter:
             base_inputs.append(torch.ones(self.num_ip_layers, dtype=torch.float32, device=self.device))
+        if self.use_sdxl_added_cond and not self.use_fused_controlnet:
+            base_inputs.append(
+                torch.randn(
+                    export_batch_size,
+                    1280,
+                    dtype=dtype,
+                    device=self.device,
+                )
+            )
+            base_inputs.append(
+                torch.randn(
+                    export_batch_size,
+                    6,
+                    dtype=dtype,
+                    device=self.device,
+                )
+            )
         
         if self.use_fused_controlnet:
             for channels in self.fused_controlnet_conditioning_channels:
                 base_inputs.append(
                     torch.randn(
-                        2 * export_batch_size,
+                        export_batch_size,
                         channels,
                         image_height,
                         image_width,
@@ -798,7 +833,7 @@ class UNet(BaseModel):
             if self.use_sdxl_added_cond:
                 base_inputs.append(
                     torch.randn(
-                        2 * export_batch_size,
+                        export_batch_size,
                         1280,
                         dtype=dtype,
                         device=self.device,
@@ -806,7 +841,7 @@ class UNet(BaseModel):
                 )
                 base_inputs.append(
                     torch.randn(
-                        2 * export_batch_size,
+                        export_batch_size,
                         6,
                         dtype=dtype,
                         device=self.device,
@@ -828,7 +863,7 @@ class UNet(BaseModel):
                 control_width = shape_spec["width"]
                 
                 control_input = torch.randn(
-                    2 * export_batch_size, channels, control_height, control_width, 
+                    export_batch_size, channels, control_height, control_width, 
                     dtype=dtype, device=self.device
                 )
                 control_inputs.append(control_input)
@@ -840,7 +875,7 @@ class UNet(BaseModel):
             base_inputs = base_inputs + control_inputs
         
         if self.use_cached_attn:
-            base_inputs = base_inputs + [torch.randn(2, self.cache_maxframes, 2 * export_batch_size, shape[0], shape[1], dtype=torch.float16).to(self.device) for shape in self.kvo_cache_shapes]
+            base_inputs = base_inputs + [torch.randn(2, self.cache_maxframes, export_batch_size, shape[0], shape[1], dtype=torch.float16).to(self.device) for shape in self.kvo_cache_shapes]
         return tuple(base_inputs)
 
 

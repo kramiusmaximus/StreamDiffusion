@@ -137,6 +137,7 @@ class EngineManager:
                        use_controlnet: Optional[bool] = None,
                        use_fused_controlnet: bool = False,
                        fused_controlnet_model_ids: Optional[list[str]] = None,
+                       use_sdxl_added_cond: bool = False,
                        use_cached_attn: bool = False,
                        cache_maxframes: Optional[int] = None,
                        max_cache_maxframes: Optional[int] = None,
@@ -211,6 +212,8 @@ class EngineManager:
                     prefix += "--cn"
                 if use_fused_controlnet and fused_controlnet_model_ids:
                     prefix += f"--fusedcn-{self._fused_controlnet_signature(fused_controlnet_model_ids)}"
+                if use_sdxl_added_cond:
+                    prefix += "--sdxlcond-v3"
                 normalized_precision = str(trt_precision).strip().lower()
                 if normalized_precision != "fp16":
                     prefix += f"--trtprec-{normalized_precision}"
@@ -390,6 +393,7 @@ class EngineManager:
         setattr(loaded_engine, 'use_control', kwargs.get('use_controlnet_trt', False))
         setattr(loaded_engine, 'use_ipadapter', kwargs.get('use_ipadapter_trt', False))
         setattr(loaded_engine, 'use_fused_controlnet', kwargs.get('use_fused_controlnet_trt', False))
+        setattr(loaded_engine, 'use_sdxl_added_cond', kwargs.get('use_sdxl_added_cond', False))
         setattr(loaded_engine, 'trt_precision', kwargs.get('trt_precision', 'fp16'))
         setattr(loaded_engine, 'max_cache_maxframes', kwargs.get('max_cache_maxframes'))
         setattr(loaded_engine, 'cache_maxframes', kwargs.get('cache_maxframes'))
@@ -408,12 +412,6 @@ class EngineManager:
                 'fused_controlnet_count',
                 kwargs.get('fused_controlnet_count', 0),
             )
-            setattr(
-                loaded_engine,
-                'use_sdxl_added_cond',
-                kwargs.get('use_sdxl_added_cond', False),
-            )
-            
         if kwargs.get('use_ipadapter_trt', False):
             setattr(loaded_engine, 'ipadapter_arch', kwargs.get('unet_arch', {}))
             # number of IP-attention layers for runtime vector sizing

@@ -1641,6 +1641,7 @@ class StreamDiffusionWrapper:
                     use_controlnet=(use_controlnet_trt or use_fused_controlnet_trt),
                     use_fused_controlnet=use_fused_controlnet_trt,
                     fused_controlnet_model_ids=[cfg["model_id"] for cfg in normalized_controlnet_configs] if use_fused_controlnet_trt else None,
+                    use_sdxl_added_cond=is_sdxl,
                     use_cached_attn=use_cached_attn,
                     cache_maxframes=cache_maxframes if use_cached_attn else None,
                     max_cache_maxframes=max_cache_maxframes if use_cached_attn else None,
@@ -1853,7 +1854,7 @@ class StreamDiffusionWrapper:
                     use_control=use_controlnet_trt and not use_fused_controlnet_trt,
                     use_fused_controlnet=use_fused_controlnet_trt,
                     fused_controlnet_conditioning_channels=fused_controlnet_conditioning_channels if use_fused_controlnet_trt else None,
-                    use_sdxl_added_cond=is_sdxl if use_fused_controlnet_trt else False,
+                    use_sdxl_added_cond=is_sdxl,
                     unet_arch=unet_arch if use_controlnet_trt else None,
                     use_ipadapter=use_ipadapter_trt,
                     num_image_tokens=num_tokens,
@@ -1957,7 +1958,7 @@ class StreamDiffusionWrapper:
                         num_ip_layers=num_ip_layers if use_ipadapter_trt else None,
                         fused_controlnet_conditioning_channels=fused_controlnet_conditioning_channels if use_fused_controlnet_trt else [],
                         fused_controlnet_count=len(fused_controlnet_conditioning_channels) if use_fused_controlnet_trt else 0,
-                        use_sdxl_added_cond=is_sdxl if use_fused_controlnet_trt else False,
+                        use_sdxl_added_cond=is_sdxl,
                         trt_precision=trt_precision,
                         engine_build_options=self._get_trt_engine_build_options("unet")
                     )

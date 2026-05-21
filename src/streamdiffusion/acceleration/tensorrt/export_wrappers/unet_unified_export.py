@@ -118,6 +118,12 @@ class UnifiedExportWrapper(torch.nn.Module):
     def _basic_unet_forward(
         self, sample, timestep, encoder_hidden_states, *kvo_cache, **kwargs
     ):
+        added_cond_kwargs, kvo_cache = self._extract_sdxl_added_cond(
+            sample, kvo_cache, kwargs
+        )
+        if added_cond_kwargs is not None:
+            kwargs["added_cond_kwargs"] = added_cond_kwargs
+
         unet_kwargs = {
             "sample": sample,
             "timestep": timestep,
@@ -158,10 +164,20 @@ class UnifiedExportWrapper(torch.nn.Module):
             return None, args
 
         if len(args) >= 2:
-            return {
-                "text_embeds": args[0],
-                "time_ids": args[1],
-            }, args[2:]
+            maybe_text_embeds = args[0]
+            maybe_time_ids = args[1]
+            if (
+                isinstance(maybe_text_embeds, torch.Tensor)
+                and isinstance(maybe_time_ids, torch.Tensor)
+                and maybe_text_embeds.dim() == 2
+                and maybe_time_ids.dim() == 2
+                and maybe_text_embeds.shape[-1] == 1280
+                and maybe_time_ids.shape[-1] == 6
+            ):
+                return {
+                    "text_embeds": maybe_text_embeds,
+                    "time_ids": maybe_time_ids,
+                }, args[2:]
 
         batch_size = sample.shape[0]
         return {

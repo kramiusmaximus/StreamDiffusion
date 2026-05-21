@@ -69,6 +69,10 @@ class SDXLExportWrapper(torch.nn.Module):
 
     def _test_added_cond_support(self):
         """Test if this SDXL model supports added_cond_kwargs"""
+        if hasattr(self.unet, "_extract_sdxl_added_cond"):
+            logger.info("SDXL model uses unified export wrapper for added_cond_kwargs")
+            return True
+
         try:
             # Create minimal test inputs
             sample = torch.randn(1, 4, 8, 8, device='cuda', dtype=torch.float16)
